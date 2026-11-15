@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Five Crowns — Multiplayer Test Page</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; max-width: 860px; }
+  button { padding: 6px 12px; margin: 2px; cursor: pointer; }
+  input { padding: 6px; margin: 2px; }
+  .card { display: inline-block; border: 1px solid #555; border-radius: 6px; padding: 6px 8px; margin: 2px; cursor: pointer; user-select: none; background: #fff; }
+  .card.sel { background: #ffe08a; border-color: #b8860b; }
+  .card.wild { box-shadow: inset 0 0 0 2px #c9a227; }
+  .joker { background: #e6d7ff; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  td, th { border: 1px solid #bbb; padding: 4px 8px; text-align: left; }
+  #log { font-size: 13px; color: #333; max-height: 180px; overflow-y: auto; border: 1px solid #ddd; padding: 8px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<h1>Five Crowns — multiplayer test page</h1>
+<p>Deliberately plain: just enough to prove two browsers stay in sync. Open this page in two tabs/windows, create a room in one, join with the code in the other.</p>
+
+<div id="lobby-controls">
+  <input id="name" placeholder="Your name" value="">
+  <button id="create">Create room</button>
+  <input id="code" placeholder="CODE" size="6" style="text-transform:uppercase">
+  <button id="join">Join room</button>
+  <span id="conn">not connected</span>
+</div>
+
+<div id="room" class="hidden">
+  <h2>Room <span id="room-code"></span> <small id="phase"></small></h2>
+  <div id="host-controls" class="hidden">
+    <button id="add-bot">Add bot</button>
+    <button id="start">Start game</button>
+    <button id="start-fill">Fill empty seats with bots &amp; start</button>
+  </div>
+  <table id="players"></table>
+
+  <div id="game" class="hidden">
+    <p id="status"></p>
+    <p>Discard top: <span id="discard-top">—</span> · Stock: <span id="stock-count">0</span></p>
+    <button id="draw-stock">Draw from stock</button>
+    <button id="draw-discard">Take discard</button>
+    <h3>Your hand <small>(click cards to select)</small></h3>
+    <div id="hand"></div>
+    <button id="meld">Lay down selected as a group</button>
+    <button id="discard">Discard selected (1 card)</button>
+    <h3>Your groups</h3>
+    <div id="my-groups"></div>
+    <p id="round-result"></p>
+  </div>
+</div>
+
+<h3>Log</h3>
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const SUIT_SYMBOL = { stars: '★', hearts: '♥', spades: '♠', clubs: '♣', diamonds: '♦' };
+const RANK_LABEL = { 11: 'J', 12: 'Q', 13: 'K' };
+let ws = null, myId = null, state = null, selected = new Set();
+
+function cardLabel(c) {
+  if (!c) return '—';
+  if (c.suit === 'joker') return 'JOKER';
+  return (RANK_LABEL[c.rank] || c.rank) + SUIT_SYMBOL[c.suit];
+}
+function log(line) {
+  const el = $('log');
+  el.innerHTML += '<div>' + line + '</div>';
+  el.scrollTop = el.scrollHeight;
+}
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host);
+  ws.onopen = () => { $('conn').textContent = 'connected'; };
+  ws.onclose = () => { $('conn').textContent = 'disconnected'; log('Disconnected.'); };
+  ws.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'room_joined') { myId = msg.playerId; log('Joined room ' + msg.code + ' as ' + myId); }
+    if (msg.type === 'error') log('⚠ ' + msg.message);
+    if (msg.type === 'event') log('Event: ' + msg.event + ' ' + JSON.stringify(msg.data));
+    if (msg.type === 'state') { state = msg; render(); }
+  };
+}
+function send(obj) { ws.send(JSON.stringify(obj)); }
+
+function render() {
+  if (!state) return;
+  $('room').classList.remove('hidden');
+  $('room-code').textContent = state.code;
+  $('phase').textContent = '— ' + state.phase + (state.phase === 'playing' || state.phase === 'round_end' ? ', round ' + state.round + ' of 11, ' + state.wildLabel + 's wild' : '');
+  const me = state.players.find(p => p.id === myId);
+  $('host-controls').classList.toggle('hidden', !(me && me.isHost && (state.phase === 'lobby' || state.phase === 'game_end')));
+  $('game').classList.toggle('hidden', state.phase === 'lobby');
+
+  $('players').innerHTML = '<tr><th>Player</th><th>Cards</th><th>Groups down</th><th>Total score</th></tr>' +
+    state.players.map(p => '<tr><td>' + p.name + (p.isBot ? ' (bot)' : '') + (p.id === myId ? ' — you' : '') + (p.isCurrent ? ' ⬅ turn' : '') + '</td><td>' +
+      p.handCount + '</td><td>' + p.groups.map(g => g.map(cardLabel).join(' ')).join(' · ') + '</td><td>' + p.totalScore + '</td></tr>').join('');
+
+  const myTurn = state.currentPlayerId === myId && state.phase === 'playing';
+  $('status').textContent = state.phase !== 'playing' ? (state.lastEvent || '') :
+    (myTurn ? (state.turnPhase === 'draw' ? 'Your turn — draw a card.' : 'Your turn — lay down groups, then discard.') :
+      'Waiting for ' + (state.players.find(p => p.id === state.currentPlayerId) || {}).name + '…');
+  $('discard-top').textContent = cardLabel(state.discardTop);
+  $('stock-count').textContent = state.stockCount;
+  $('draw-stock').disabled = $('draw-discard').disabled = !(myTurn && state.turnPhase === 'draw');
+  $('meld').disabled = $('discard').disabled = !(myTurn && state.turnPhase === 'play');
+
+  const hand = (state.you && state.you.hand) || [];
+  selected = new Set([...selected].filter(id => hand.some(c => c.id === id)));
+  $('hand').innerHTML = '';
+  for (const c of hand) {
+    const el = document.createElement('span');
+    el.className = 'card' + (selected.has(c.id) ? ' sel' : '') + (c.suit === 'joker' || c.rank === state.wildRank ? ' wild' : '') + (c.suit === 'joker' ? ' joker' : '');
+    el.textContent = cardLabel(c);
+    el.onclick = () => { selected.has(c.id) ? selected.delete(c.id) : selected.add(c.id); render(); };
+    $('hand').appendChild(el);
+  }
+  $('my-groups').textContent = ((state.you && state.you.groups) || []).map(g => g.map(cardLabel).join(' ')).join(' · ') || 'none yet';
+  $('round-result').textContent = state.lastRoundResult ?
+    'Round ' + state.lastRoundResult.round + ' scores: ' + state.lastRoundResult.results.map(r => r.name + ' +' + r.deadwood + ' (total ' + r.total + ')').join(', ') : '';
+  if (state.phase === 'game_end' && state.winners) {
+    $('round-result').textContent += ' — Game over. Winner: ' + state.players.filter(p => state.winners.includes(p.id)).map(p => p.name).join(', ');
+  }
+}
+
+$('create').onclick = () => { if (!ws) connect(); const go = () => send({ type: 'create_room', name: $('name').value || 'Player' }); ws.readyState === 1 ? go() : ws.addEventListener('open', go, { once: true }); };
+$('join').onclick = () => { if (!ws) connect(); const go = () => send({ type: 'join_room', code: $('code').value, name: $('name').value || 'Player' }); ws.readyState === 1 ? go() : ws.addEventListener('open', go, { once: true }); };
+$('add-bot').onclick = () => send({ type: 'add_bot' });
+$('start').onclick = () => send({ type: 'start_game' });
+$('start-fill').onclick = () => send({ type: 'start_game', fillWithBots: true });
+$('draw-stock').onclick = () => send({ type: 'draw', source: 'stock' });
+$('draw-discard').onclick = () => send({ type: 'draw', source: 'discard' });
+$('meld').onclick = () => { send({ type: 'meld', cardIds: [...selected] }); selected.clear(); };
+$('discard').onclick = () => { if (selected.size === 1) { send({ type: 'discard', cardId: [...selected][0] }); selected.clear(); } else log('Select exactly one card to discard.'); };
+</script>
+</body>
+</html>
