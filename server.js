@@ -67,6 +67,41 @@ function handScore(hand, wildRank) {
   return hand.reduce((sum, c) => sum + deadwoodValue(c, wildRank), 0);
 }
 
+/*
+ * Round-end scoring (fixed 15 Nov 2026): a player is charged only for
+ * DEADWOOD — cards that cannot be part of a complete book or run.
+ * Completed sets left in hand (e.g. Matthew's 6,6,wild book) score 0.
+ * Exact solver: enumerate every valid meld in the hand, then find the
+ * disjoint set of melds covering the most points; the rest is deadwood.
+ */
+function bestDeadwood(hand, wildRank) {
+  const n = hand.length;
+  if (n === 0) return 0;
+  const meldMasks = [];
+  for (let mask = 0; mask < (1 << n); mask++) {
+    let bits = 0;
+    for (let m = mask; m; m >>= 1) bits += m & 1;
+    if (bits < 3) continue;
+    const cards = hand.filter((_, i) => mask & (1 << i));
+    if (validateMeld(cards, wildRank).valid) meldMasks.push(mask);
+  }
+  const maskValue = mask =>
+    hand.reduce((s, c, i) => (mask & (1 << i)) ? s + deadwoodValue(c, wildRank) : s, 0);
+  const valued = meldMasks
+    .map(mask => ({ mask, value: maskValue(mask) }))
+    .sort((a, b) => b.value - a.value);
+  let bestCovered = 0;
+  const search = (idx, used, covered) => {
+    if (covered > bestCovered) bestCovered = covered;
+    for (let i = idx; i < valued.length; i++) {
+      if (valued[i].mask & used) continue;
+      search(i + 1, used | valued[i].mask, covered + valued[i].value);
+    }
+  };
+  search(0, 0, 0);
+  return handScore(hand, wildRank) - bestCovered;
+}
+
 /* ------------------------------------------------------------------ */
 /* Meld rules                                                          */
 /* ------------------------------------------------------------------ */
@@ -141,12 +176,12 @@ function findMelds(hand, wildRank) {
         if (gaps + gap > wildsInPool().length) break;
         gaps += gap; seq.push(rem[j]); last = rem[j].rank; j++;
       }
-      const extra = Math.max(0, 4 - (seq.length + gaps));
+      const extra = Math.max(0, 3 - (seq.length + gaps));
       const need = gaps + extra;
       const totalLen = seq.length + gaps + extra;
       const lo = Math.max(3, seq[seq.length - 1].rank - totalLen + 1);
       const hi = Math.min(seq[0].rank, 13 - totalLen + 1);
-      if (totalLen >= 4 && need <= wildsInPool().length && lo <= hi) {
+      if (totalLen >= 3 && need <= wildsInPool().length && lo <= hi) {
         take([...seq, ...wildsInPool().slice(0, need)]);
         const used = new Set(seq.map(c => c.id));
         rem = rem.filter(c => !used.has(c.id));
@@ -313,7 +348,7 @@ function scoreRound(room) {
   room.phase = 'round_end';
   room.finalPending = null;
   const results = room.players.map(p => {
-    const deadwood = handScore(p.hand, room.wildRank);
+    const deadwood = bestDeadwood(p.hand, room.wildRank);
     p.totalScore += deadwood;
     return { playerId: p.id, name: p.name, deadwood, total: p.totalScore };
   });
