@@ -20,7 +20,7 @@ const PORT = process.env.PORT || 3000;
 const BOT_DELAY_MS = Number(process.env.BOT_DELAY_MS || 1100);
 const BOT_DISCARD_DELAY_MS = Number(process.env.BOT_DISCARD_DELAY_MS || 900);
 const ROUND_DELAY_MS = Number(process.env.ROUND_DELAY_MS || 3000);
-const F7_FLIP_MS = Number(process.env.F7_FLIP_MS || 650); // pace of forced flips (Flip Three sequences)
+const F7_FLIP_MS = Number(process.env.F7_FLIP_MS || 900); // pace of forced flips (Flip Three sequences)
 const MAX_RESHUFFLES = 2; // backstop: after this many stock reshuffles a round is scored as-is
 
 /* ------------------------------------------------------------------ */
@@ -589,6 +589,7 @@ function f7HasSecond(p) {
 function f7LineScore(p) {
   let sum = 0, plus = 0, times = false;
   for (const c of p.line) {
+    if (c.bust) continue; // the card that busted (or was saved): visible, scores nothing
     if (c.kind === 'number') sum += c.value;
     else if (c.kind === 'modifier') { if (c.mod === 'times') times = true; else plus += c.value; }
   }
@@ -648,13 +649,8 @@ function f7StartRound(room) {
     p.banked = 0;
     p.roundGained = 0;
   }
-  // Opening card for everyone: action cards are set aside and replaced so
-  // nobody has to pick a target before the round has even started.
-  for (const p of room.players) {
-    let card = f7Draw(room);
-    while (card && card.kind === 'action') { room.f7discard.push(card); card = f7Draw(room); }
-    if (card) p.line.push(card);
-  }
+  // No opening deal — matching the offline game, your first turn is your
+  // first flip. Everyone starts the round with an empty line.
   room.phase = 'playing';
   const starter = room.players[(room.round - 1) % room.players.length];
   room.currentPlayerId = starter.id;
@@ -754,11 +750,14 @@ function f7DoStay(room, player) {
  * bust the player, or end the round (Flip 7). */
 function f7ResolveDrawn(room, player, card) {
   if (card.kind === 'number') {
-    const dup = player.line.some(c => c.kind === 'number' && c.value === card.value);
+    const dup = player.line.some(c => c.kind === 'number' && !c.bust && c.value === card.value);
     if (dup) {
+      // The drawn card stays in the line, flagged, so the player can SEE
+      // what they drew — it scores nothing either way.
+      card.bust = true;
+      player.line.push(card);
       if (f7HasSecond(player)) {
         player.line = player.line.filter(c => !(c.kind === 'action' && c.action === 'second'));
-        room.f7discard.push(card);
         room.lastEvent = player.name + ' flipped a duplicate ' + card.value + ' — Second Chance saved them';
         return;
       }

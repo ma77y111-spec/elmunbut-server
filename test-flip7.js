@@ -140,9 +140,8 @@ async function main() {
 
   a.send({ type: 'start_game' });
   await waitFor(() => a.firstPlaying, 'game starts', 5000);
-  check(a.firstPlaying.players.every(p => p.line.length === 1), 'everyone was dealt exactly one opening card');
-  check(a.firstPlaying.players.every(p => p.line.every(card => card.kind !== 'action')),
-    'no action cards in the opening deal');
+  check(a.firstPlaying.players.every(p => p.line.length === 0),
+    'no opening deal — everyone starts with an empty line, like the offline game');
 
   // Watch for invariant violations across the whole game.
   let dupViolation = 0;
@@ -150,7 +149,9 @@ async function main() {
     const s = a.state;
     if (!s || s.phase !== 'playing') return;
     for (const p of s.players) {
-      const nums = p.line.filter(x => x.kind === 'number').map(x => x.value);
+      // Bust-flagged cards are shown in the line on purpose (the card that
+      // busted you, or was saved by a Second Chance) — they don't count.
+      const nums = p.line.filter(x => x.kind === 'number' && !x.bust).map(x => x.value);
       if (new Set(nums).size !== nums.length && p.status === 'in') dupViolation++;
     }
   }, 30);
