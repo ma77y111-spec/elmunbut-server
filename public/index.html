@@ -46,7 +46,7 @@
     <button id="draw-discard">Take discard</button>
     <h3>Your hand <small>(click cards to select)</small></h3>
     <div id="hand"></div>
-    <button id="meld">Lay down selected as a group</button>
+    <button id="goout">Go out (discard selected)</button>
     <button id="discard">Discard selected (1 card)</button>
     <h3>Your groups</h3>
     <div id="my-groups"></div>
@@ -103,12 +103,12 @@ function render() {
 
   const myTurn = state.currentPlayerId === myId && state.phase === 'playing';
   $('status').textContent = state.phase !== 'playing' ? (state.lastEvent || '') :
-    (myTurn ? (state.turnPhase === 'draw' ? 'Your turn — draw a card.' : 'Your turn — lay down groups, then discard.') :
+    (myTurn ? (state.turnPhase === 'draw' ? 'Your turn — draw a card.' : 'Your turn — discard, or go out if every other card forms books or runs.') :
       'Waiting for ' + (state.players.find(p => p.id === state.currentPlayerId) || {}).name + '…');
   $('discard-top').textContent = cardLabel(state.discardTop);
   $('stock-count').textContent = state.stockCount;
   $('draw-stock').disabled = $('draw-discard').disabled = !(myTurn && state.turnPhase === 'draw');
-  $('meld').disabled = $('discard').disabled = !(myTurn && state.turnPhase === 'play');
+  $('goout').disabled = $('discard').disabled = !(myTurn && state.turnPhase === 'play');
 
   const hand = (state.you && state.you.hand) || [];
   selected = new Set([...selected].filter(id => hand.some(c => c.id === id)));
@@ -135,7 +135,7 @@ $('start').onclick = () => send({ type: 'start_game' });
 $('start-fill').onclick = () => send({ type: 'start_game', fillWithBots: true });
 $('draw-stock').onclick = () => send({ type: 'draw', source: 'stock' });
 $('draw-discard').onclick = () => send({ type: 'draw', source: 'discard' });
-$('meld').onclick = () => { send({ type: 'meld', cardIds: [...selected] }); selected.clear(); };
+$('goout').onclick = () => { if (selected.size === 1) { send({ type: 'go_out', discardId: [...selected][0] }); selected.clear(); } else log('Select exactly one card — your discard — to go out.'); };
 $('discard').onclick = () => { if (selected.size === 1) { send({ type: 'discard', cardId: [...selected][0] }); selected.clear(); } else log('Select exactly one card to discard.'); };
 </script>
 </body>
