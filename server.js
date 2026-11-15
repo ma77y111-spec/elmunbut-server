@@ -20,7 +20,10 @@ const PORT = process.env.PORT || 3000;
 const BOT_DELAY_MS = Number(process.env.BOT_DELAY_MS || 1100);
 const BOT_DISCARD_DELAY_MS = Number(process.env.BOT_DISCARD_DELAY_MS || 900);
 const ROUND_DELAY_MS = Number(process.env.ROUND_DELAY_MS || 3000);
-const F7_FLIP_MS = Number(process.env.F7_FLIP_MS || 900); // pace of forced flips (Flip Three sequences)
+const F7_FLIP_MS = Number(process.env.F7_FLIP_MS || 1100); // pace of forced flips (Flip Three sequences)
+const F7_END_BEAT_MS = Number(process.env.F7_END_BEAT_MS || 1800); // hold after the round's last card lands, before results
+const F7_BOT_DELAY_MS = Number(process.env.F7_BOT_DELAY_MS || 1500); // bot thinking time before a Flip 7 decision — the table needs time to see each card land (Matthew, 15 Nov 2026)
+const F7_BOT_TARGET_MS = Number(process.env.F7_BOT_TARGET_MS || 1100); // bot thinking time before choosing a target
 const MAX_RESHUFFLES = 2; // backstop: after this many stock reshuffles a round is scored as-is
 
 /* ------------------------------------------------------------------ */
@@ -612,6 +615,7 @@ function f7StateFor(room, viewer) {
     currentPlayerId: room.currentPlayerId,
     deckCount: room.stock.length,
     flipping: room.f7seq.length > 0, // a Flip Three sequence is mid-flight
+    ending: !!room.f7Ending, // the round's last card has landed; results follow in a beat
     pendingAction: room.pendingAction ? { kind: room.pendingAction.kind, byId: room.pendingAction.byId } : null,
     you: viewer ? { id: viewer.id } : null,
     players: room.players.map(p => ({
@@ -643,6 +647,7 @@ function f7StartRound(room) {
   room.pendingCard = null;
   room.f7Stage = 'decide';
   room.flip7PlayerId = null;
+  room.f7Ending = false;
   for (const p of room.players) {
     p.line = [];
     p.status = 'in';
@@ -671,10 +676,10 @@ function f7Draw(room) {
 /* One driver for everything that happens next, so turn flips, Flip Three
  * sequences, target prompts and bots can never fight over the flow. */
 function f7Continue(room) {
-  if (room.phase !== 'playing') return;
+  if (room.phase !== 'playing' || room.f7Ending) return;
   if (room.pendingAction) {
     const by = room.players.find(p => p.id === room.pendingAction.byId);
-    if (by && by.isBot) f7Schedule(room, BOT_DISCARD_DELAY_MS, () => f7BotTarget(room));
+    if (by && by.isBot) f7Schedule(room, F7_BOT_TARGET_MS, () => f7BotTarget(room));
     return;
   }
   if (room.f7seq.length) {
@@ -684,7 +689,7 @@ function f7Continue(room) {
   if (room.f7Stage === 'resolving') { f7Advance(room); return; }
   const p = currentPlayer(room);
   if (!p || p.status !== 'in') { f7Advance(room); return; }
-  if (p.isBot) f7Schedule(room, BOT_DELAY_MS, () => f7BotDecision(room));
+  if (p.isBot) f7Schedule(room, F7_BOT_DELAY_MS, () => f7BotDecision(room));
 }
 
 function f7Schedule(room, delay, fn) {
@@ -711,11 +716,26 @@ function f7Advance(room) {
       return;
     }
   }
-  f7ScoreRound(room);
+  f7EndRound(room);
+}
+
+/* The round is over, but the last card flipped must be SEEN to land
+ * first (Matthew, 15 Nov 2026: a bust by the last player in jumped
+ * straight to the results — "the drawing and landing of the card is
+ * important; lands, if bust, then the game moves on"). So the table
+ * holds for a beat in the playing state before scoring. */
+function f7EndRound(room) {
+  if (room.phase !== 'playing' || room.f7Ending) return;
+  room.f7Ending = true;
+  broadcast(room);
+  setTimeout(() => {
+    if (room.phase === 'playing') f7ScoreRound(room);
+  }, F7_END_BEAT_MS);
 }
 
 function f7DoHit(room, player) {
   if (room.phase !== 'playing') return 'the game is not in play';
+  if (room.f7Ending) return 'the round is ending';
   if (room.pendingAction) return 'choose a target first';
   if (room.f7seq.length) return 'cards are still flipping';
   if (currentPlayer(room) !== player) return 'not your turn';
@@ -723,7 +743,7 @@ function f7DoHit(room, player) {
   if (player.status !== 'in') return 'you are out of this round';
   room.f7Stage = 'resolving';
   const card = f7Draw(room);
-  if (!card) { f7ScoreRound(room); return null; }
+  if (!card) { f7EndRound(room); return null; }
   f7ResolveDrawn(room, player, card);
   broadcast(room);
   f7Continue(room);
@@ -732,6 +752,7 @@ function f7DoHit(room, player) {
 
 function f7DoStay(room, player) {
   if (room.phase !== 'playing') return 'the game is not in play';
+  if (room.f7Ending) return 'the round is ending';
   if (room.pendingAction) return 'choose a target first';
   if (room.f7seq.length) return 'cards are still flipping';
   if (currentPlayer(room) !== player) return 'not your turn';
@@ -775,7 +796,7 @@ function f7ResolveDrawn(room, player, card) {
         if (p.status === 'in') { p.banked = f7LineScore(p); p.status = 'banked'; }
       }
       room.lastEvent = player.name + ' flipped 7 unique numbers — Flip 7! +15';
-      f7ScoreRound(room);
+      f7EndRound(room);
     }
     return;
   }
@@ -853,10 +874,11 @@ function f7SeqStep(room) {
     return;
   }
   const card = f7Draw(room);
-  if (!card) { f7ScoreRound(room); return; }
+  if (!card) { f7EndRound(room); return; }
   top.left--;
   f7ResolveDrawn(room, p, card);
   if (room.phase !== 'playing') return; // Flip 7 ended the round mid-sequence
+  if (room.f7Ending) { broadcast(room); return; } // hold the table on the landed card
   if (p.status !== 'in') room.f7seq = room.f7seq.filter(s => s.playerId !== p.id);
   else if (top.left <= 0) room.f7seq = room.f7seq.filter(s => s !== top);
   broadcast(room);
@@ -979,7 +1001,7 @@ function startServer(port) {
             // lives in room.stock; f7discard is its reshuffle pile.
             f7seq: [], pendingAction: null, pendingCard: null,
             f7Stage: 'decide', f7Scheduled: false, flip7PlayerId: null,
-            f7discard: [],
+            f7discard: [], f7Ending: false,
           };
           me = makePlayer(name, false);
           me.ws = ws; me.connected = true;

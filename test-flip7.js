@@ -13,6 +13,9 @@
 process.env.BOT_DELAY_MS = '20';
 process.env.BOT_DISCARD_DELAY_MS = '15';
 process.env.F7_FLIP_MS = '15';
+process.env.F7_BOT_DELAY_MS = '25';
+process.env.F7_BOT_TARGET_MS = '15';
+process.env.F7_END_BEAT_MS = '60';
 process.env.ROUND_DELAY_MS = '250';
 
 const WebSocket = require('ws');
@@ -32,7 +35,15 @@ function makeClient(name) {
     name, ws: null, id: null, code: null, state: null,
     errors: [], done: false, actedOnVersion: -1, firstPlaying: null,
   };
-  c.send = (obj) => c.ws.send(JSON.stringify(obj));
+  c.send = (obj) => {
+    const s = c.state;
+    const me = s && s.players ? s.players.find(p => p.id === c.id) : null;
+    c.lastSend = obj.type + ' @phase=' + (s && s.phase) + ' round=' + (s && s.round)
+      + ' current=' + (s && s.currentPlayerId === c.id) + ' me=' + (me && me.status)
+      + ' pending=' + (s && s.pendingAction ? s.pendingAction.kind + '/' + (s.pendingAction.byId === c.id) : 'no')
+      + ' flipping=' + (s && s.flipping) + ' ending=' + (s && s.ending);
+    c.ws.send(JSON.stringify(obj));
+  };
   c.connect = () => new Promise((resolve, reject) => {
     c.ws = new WebSocket(URL);
     c.ws.on('open', resolve);
@@ -41,12 +52,19 @@ function makeClient(name) {
       const msg = JSON.parse(buf.toString());
       if (msg.type === 'room_joined') { c.id = msg.playerId; c.code = msg.code; }
       if (msg.type === 'error') {
-        // A move sent from a stale 'playing' view can land just after the
-        // round/game ended server-side; the client already knows the game
-        // moved on, so that rejection is benign. Anything else is real.
+        // A move sent from a stale view can cross the round-end transition
+        // in flight: the server's ending/round_end state precedes the error
+        // in the stream, so by the time the error arrives the client has
+        // already seen the round end. Those rejections are benign; any
+        // other error is real.
         const stalePhase = msg.message === 'the game is not in play'
           && c.state && c.state.phase !== 'playing';
-        if (!stalePhase) c.errors.push(msg.message);
+        const staleEnding = msg.message === 'the round is ending'
+          && c.state && (c.state.ending || c.state.phase !== 'playing');
+        if (!stalePhase && !staleEnding) {
+          c.errors.push(msg.message);
+          console.log('    [' + c.name + '] error "' + msg.message + '" after send: ' + c.lastSend);
+        }
       }
       if (msg.type === 'state') {
         c.state = msg;
@@ -91,12 +109,12 @@ function maybeAct(c) {
     return;
   }
   // Our decision turn: hit below 15, stay at 15+.
-  if (s.currentPlayerId === c.id && me.status === 'in' && !s.pendingAction && !s.flipping) {
+  if (s.currentPlayerId === c.id && me.status === 'in' && !s.pendingAction && !s.flipping && !s.ending) {
     setTimeout(() => {
       if (!c.state || c.state.phase !== 'playing') return;
       const m = myPlayer(c);
       if (c.state.currentPlayerId !== c.id || !m || m.status !== 'in') return;
-      if (c.state.pendingAction || c.state.flipping) return;
+      if (c.state.pendingAction || c.state.flipping || c.state.ending) return;
       c.send({ type: m.lineScore >= 15 ? 'f7_stay' : 'f7_hit' });
     }, 5);
   }
