@@ -110,12 +110,14 @@ function bestDeadwood(hand, wildRank) {
  * Run:  3+ cards (Matthew's rule, 15 Nov 2026: "anything 3 cards and
  *       over"), every natural card the same suit, natural ranks all
  *       different, and the naturals plus wilds can form one sequence
- *       inside 3..King. At least one natural card is required in a meld.
+ *       inside 3..King. A meld of nothing but wild cards also counts
+ *       (Matthew, 15 Nov 2026: "I can't see why 3 wilds can't be a
+ *       hand") — wilds stand for anything, including a full set.
  */
 function validateMeld(cards, wildRank) {
   if (!Array.isArray(cards) || cards.length < 3) return { valid: false };
   const nats = cards.filter(c => !isWild(c, wildRank));
-  if (nats.length === 0) return { valid: false };
+  if (nats.length === 0) return { valid: true, type: 'book' };
   if (nats.every(c => c.rank === nats[0].rank)) return { valid: true, type: 'book' };
   if (nats.every(c => c.suit === nats[0].suit)) {
     const ranks = nats.map(c => c.rank);
@@ -191,6 +193,9 @@ function findMelds(hand, wildRank) {
       }
     }
   }
+
+  // Leftover wilds: 3+ of them on their own are a valid meld too.
+  while (wildsInPool().length >= 3) take(wildsInPool().slice(0, 3));
   return melds;
 }
 
