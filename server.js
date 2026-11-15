@@ -72,7 +72,8 @@ function handScore(hand, wildRank) {
 /* ------------------------------------------------------------------ */
 /*
  * Book: 3+ cards, every natural (non-wild) card the same rank.
- * Run:  4+ cards, every natural card the same suit, natural ranks all
+ * Run:  3+ cards (Matthew's rule, 15 Nov 2026: "anything 3 cards and
+ *       over"), every natural card the same suit, natural ranks all
  *       different, and the naturals plus wilds can form one sequence
  *       inside 3..King. At least one natural card is required in a meld.
  */
@@ -81,7 +82,7 @@ function validateMeld(cards, wildRank) {
   const nats = cards.filter(c => !isWild(c, wildRank));
   if (nats.length === 0) return { valid: false };
   if (nats.every(c => c.rank === nats[0].rank)) return { valid: true, type: 'book' };
-  if (cards.length >= 4 && nats.every(c => c.suit === nats[0].suit)) {
+  if (nats.every(c => c.suit === nats[0].suit)) {
     const ranks = nats.map(c => c.rank);
     if (new Set(ranks).size === ranks.length) {
       const n = cards.length;
@@ -414,7 +415,7 @@ function doGoOut(room, player, groupIds, discardId) {
         seen.add(c.id);
       }
       const check = validateMeld(cards, room.wildRank);
-      if (!check.valid) return 'every group must be a valid book (3+ of a rank) or run (4+ of a suit in sequence)';
+      if (!check.valid) return 'every group must be a valid book (3+ of a rank) or run (3+ of a suit in sequence)';
       groups.push(cards);
     }
     if (seen.size !== player.hand.length - 1) return 'all cards except your discard must be in groups to go out';
