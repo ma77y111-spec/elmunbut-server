@@ -1,0 +1,1 @@
+{"dependencies":{"ws":"^8.18.0"},"description":"Authoritative WebSocket multiplayer server for the ElMunBut Five Crowns game, with bots and a browser test page.","engines":{"node":">=18"},"main":"server.js","name":"elmunbut-five-crowns-multiplayer","scripts":{"start":"node server.js","test":"node test.js"},"type":"commonjs","version":"1.0.0"}

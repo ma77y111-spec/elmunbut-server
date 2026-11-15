@@ -1,0 +1,16 @@
+# Render blueprint for the ElMunBut Five Crowns multiplayer server.
+# Deploy: in Render, New > Blueprint, point it at the repo holding this file.
+# Free web services spin down after ~15 minutes idle and take ~a minute to
+# wake on the next connection — fine for a family card game test.
+services:
+  - type: web
+    name: elmunbut-five-crowns
+    runtime: node
+    region: singapore
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+    # PORT is provided by Render automatically; server.js reads it.
