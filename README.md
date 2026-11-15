@@ -24,26 +24,27 @@ the turn order and the scores.
 - **Rules** match the single-player app: 116-card deck (five suits — stars,
   hearts, spades, clubs, diamonds — ranks 3 to King in duplicate, plus 6
   jokers); 11 rounds; round *r* deals *r*+2 cards and that rank is wild
-  (jokers always wild). A turn is: draw from stock or discard, optionally lay
-  down books (3+ of a rank) and runs (4+ of a suit in sequence, wilds may
-  substitute), then discard. Laying down everything and discarding (or
-  melding the whole hand) puts you out; every other player then gets exactly
-  one final turn. Deadwood scores face value 3–10, J=11, Q=12, K=13, wild
+  (jokers always wild). A turn is: draw from stock or discard, then discard.
+  Cards are never laid down mid-round — players stage groups privately in
+  their client and may rearrange them freely. You go out only when every
+  card except your final discard sits in a valid book (3+ of a rank) or run
+  (4+ of a suit in sequence, wilds may substitute); going out reveals your
+  groups, and every other player then gets exactly one final turn. Deadwood scores face value 3–10, J=11, Q=12, K=13, wild
   cards 20, jokers 50. Lowest total after 11 rounds wins.
 - **Privacy:** a client only ever receives its own hand in full. Other
   players are sent as card counts plus their public laid-down groups. Every
   move is validated server-side; public state is broadcast after every move.
 - **Disconnects:** if a player drops out mid-game, a bot takes over their
   seat so the game can finish. (In the lobby, a leaver's seat is removed.)
-- **Bots** use a simple greedy strategy: take a useful discard, meld books
-  and runs (using wilds to complete them), go out when they can, shed their
-  highest deadwood card otherwise.
+- **Bots** use a simple greedy strategy: take a useful discard, go out when their
+  whole hand forms books and runs, shed their highest deadwood card otherwise.
 - **Backstop:** if the stock is reshuffled twice in a round, the round is
   scored on the cards in hand so a round can never stall forever.
 
 Client → server messages: `create_room {name}`, `join_room {code, name}`,
-`add_bot`, `start_game {fillWithBots}`, `draw {source}`, `meld {cardIds}`,
-`discard {cardId}`. Server → client: a personalised `state` snapshot after
+`add_bot`, `start_game {fillWithBots}`, `draw {source}`,
+`go_out {groups, discardId}` (groups optional — the server can partition
+the hand itself), `discard {cardId}`. Server → client: a personalised `state` snapshot after
 every change, plus `event` messages (`went_out`, `round_scored`,
 `game_over`) and `error` replies for illegal moves.
 

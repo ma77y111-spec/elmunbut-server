@@ -246,8 +246,11 @@ function stateFor(room, viewer) {
       connected: p.isBot ? true : p.connected,
       isHost: p.id === room.hostId,
       isCurrent: p.id === room.currentPlayerId,
-      handCount: p.hand.length, // counts only — never another player's cards
-      groups: p.groups,
+      handCount: p.hand.length, // counts only while the round is in play
+      groups: p.groups, // empty until that player goes out — then revealed
+      // Hands stay hidden until the round is over; at round_end / game_end
+      // every player's remaining cards are revealed for the results.
+      hand: (room.phase === 'round_end' || room.phase === 'game_end') ? p.hand : undefined,
       totalScore: p.totalScore,
     })),
     lastRoundResult: room.lastRoundResult,
@@ -387,25 +390,46 @@ function doDraw(room, player, source) {
   return null;
 }
 
-function doMeld(room, player, cardIds) {
+/* Going out is the ONLY way cards leave a hand face-up: every card except
+ * the final discard must sit in a valid book or run. Groups are staged
+ * privately in the client during the round and are only revealed here.
+ * `groups` may be omitted, in which case the server partitions the hand
+ * itself (used by the plain test page and as a fallback). */
+function doGoOut(room, player, groupIds, discardId) {
   if (room.phase !== 'playing') return 'game is not in play';
   if (currentPlayer(room) !== player) return 'not your turn';
   if (room.turnPhase !== 'play') return 'draw a card first';
-  if (!Array.isArray(cardIds) || !cardIds.length) return 'no cards selected';
-  const cards = cardIds.map(id => player.hand.find(c => c.id === id));
-  if (cards.some(c => !c)) return 'a selected card is not in your hand';
-  const check = validateMeld(cards, room.wildRank);
-  if (!check.valid) return 'that is not a valid book (3+ of a rank) or run (4+ of a suit in sequence)';
-  const ids = new Set(cardIds);
-  player.hand = player.hand.filter(c => !ids.has(c.id));
-  player.groups.push(cards);
-  room.lastEvent = player.name + ' laid down a ' + check.type;
-  if (player.hand.length === 0) {
-    broadcast(room);
-    endTurn(room, player, true); // melded everything — out, no discard needed
-    return null;
+  const discard = player.hand.find(c => c.id === discardId);
+  if (!discard) return 'choose a card to discard';
+  let groups;
+  if (Array.isArray(groupIds) && groupIds.length) {
+    const seen = new Set();
+    groups = [];
+    for (const g of groupIds) {
+      if (!Array.isArray(g) || !g.length) return 'a group is empty';
+      const cards = g.map(id => player.hand.find(c => c.id === id));
+      if (cards.some(c => !c)) return 'a grouped card is not in your hand';
+      for (const c of cards) {
+        if (seen.has(c.id) || c.id === discardId) return 'a card is used twice';
+        seen.add(c.id);
+      }
+      const check = validateMeld(cards, room.wildRank);
+      if (!check.valid) return 'every group must be a valid book (3+ of a rank) or run (4+ of a suit in sequence)';
+      groups.push(cards);
+    }
+    if (seen.size !== player.hand.length - 1) return 'all cards except your discard must be in groups to go out';
+  } else {
+    const rest = player.hand.filter(c => c.id !== discardId);
+    const out = tryOut(rest, room.wildRank);
+    if (!out || out.discard) return 'you cannot go out yet — not all your cards form books or runs';
+    groups = out.melds;
   }
+  player.groups = groups;
+  player.hand = [];
+  room.discard.push(discard);
+  room.lastEvent = player.name + ' went out';
   broadcast(room);
+  endTurn(room, player, true);
   return null;
 }
 
@@ -446,18 +470,18 @@ function botTakeTurn(room, player) {
   }
   const out = tryOut(player.hand, room.wildRank);
   if (out) {
-    for (const meld of out.melds) {
-      if (currentPlayer(room) !== player || room.turnPhase !== 'play') break;
-      doMeld(room, player, meld.map(c => c.id));
-    }
-    if (room.phase === 'playing' && currentPlayer(room) === player && room.turnPhase === 'play' && out.discard) {
-      doDiscard(room, player, out.discard.id);
+    if (out.discard) {
+      doGoOut(room, player, out.melds.map(m => m.map(c => c.id)), out.discard.id);
+    } else {
+      // Whole hand melds with nothing spare: discard one card and let the
+      // server partition the rest; fall back to a plain discard if that fails.
+      const d = chooseDiscard(player.hand, room.wildRank);
+      if (d && doGoOut(room, player, null, d.id) && room.phase === 'playing' &&
+          currentPlayer(room) === player && room.turnPhase === 'play') {
+        doDiscard(room, player, d.id);
+      }
     }
     return;
-  }
-  for (const meld of findMelds(player.hand, room.wildRank)) {
-    if (currentPlayer(room) !== player || room.turnPhase !== 'play' || !player.hand.length) break;
-    doMeld(room, player, meld.map(c => c.id));
   }
   if (room.phase === 'playing' && currentPlayer(room) === player && room.turnPhase === 'play' && player.hand.length) {
     const d = chooseDiscard(player.hand, room.wildRank);
@@ -570,9 +594,9 @@ function startServer(port) {
           if (err) fail(err);
           break;
         }
-        case 'meld': {
+        case 'go_out': {
           if (!room || !me) return fail('join a room first');
-          const err = doMeld(room, me, msg.cardIds);
+          const err = doGoOut(room, me, msg.groups, msg.discardId);
           if (err) fail(err);
           break;
         }
