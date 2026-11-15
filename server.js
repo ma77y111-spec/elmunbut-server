@@ -20,6 +20,7 @@ const PORT = process.env.PORT || 3000;
 const BOT_DELAY_MS = Number(process.env.BOT_DELAY_MS || 1100);
 const BOT_DISCARD_DELAY_MS = Number(process.env.BOT_DISCARD_DELAY_MS || 900);
 const ROUND_DELAY_MS = Number(process.env.ROUND_DELAY_MS || 3000);
+const F7_FLIP_MS = Number(process.env.F7_FLIP_MS || 650); // pace of forced flips (Flip Three sequences)
 const MAX_RESHUFFLES = 2; // backstop: after this many stock reshuffles a round is scored as-is
 
 /* ------------------------------------------------------------------ */
@@ -258,6 +259,8 @@ function makePlayer(name, isBot) {
     id: 'p' + (++playerSeq) + Math.random().toString(36).slice(2, 7),
     name, isBot: !!isBot, connected: false, ws: null,
     hand: [], groups: [], totalScore: 0,
+    // Flip 7 per-round state (unused in Five Crowns rooms).
+    line: [], status: 'in', banked: 0, roundGained: 0,
   };
 }
 
@@ -266,8 +269,10 @@ function currentPlayer(room) {
 }
 
 function stateFor(room, viewer) {
+  if (room.game === 'flip7') return f7StateFor(room, viewer);
   return {
     type: 'state',
+    game: 'fivecrowns',
     version: room.version,
     code: room.code,
     phase: room.phase, // lobby | playing | round_end | game_end
@@ -494,6 +499,7 @@ function doDiscard(room, player, cardId) {
 /* Bots                                                                */
 /* ------------------------------------------------------------------ */
 function scheduleBot(room) {
+  if (room.game !== 'fivecrowns') return;
   if (room.phase !== 'playing' || room.botScheduled) return;
   const p = currentPlayer(room);
   if (!p || !p.isBot) return;
@@ -545,6 +551,390 @@ function botPlayStep(room, player) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Flip 7                                                              */
+/*                                                                     */
+/* Same room/lobby shell as Five Crowns, different game. All flipped   */
+/* cards are public. On your turn you flip ONE card or stay and bank;  */
+/* play then passes. A duplicate number busts (a held Second Chance    */
+/* saves you once — on a normal turn play simply passes; inside a      */
+/* Flip Three the sequence carries on). Freeze banks a player at       */
+/* their current score; Flip Three forces three flips; flipping 7      */
+/* unique numbers scores +15 and ends the round for everyone. First    */
+/* to 200 at the end of a round wins. Deck: 94 cards — numbers 0–12    */
+/* (copies equal to face value, plus a single 0), modifiers +2/+4/+6/  */
+/* +8/+10 and ×2 (one each), actions Freeze/Flip Three/Second Chance   */
+/* (three each) — mirroring the games app.                             */
+/* ------------------------------------------------------------------ */
+let f7Seq = 0;
+
+function f7CreateDeck() {
+  const cards = [];
+  const add = (c) => cards.push(Object.assign({ id: 'f' + (++f7Seq) }, c));
+  for (let v = 1; v <= 12; v++) for (let i = 0; i < v; i++) add({ kind: 'number', value: v });
+  add({ kind: 'number', value: 0 });
+  for (const m of [2, 4, 6, 8, 10]) add({ kind: 'modifier', value: m, mod: 'plus' });
+  add({ kind: 'modifier', value: 2, mod: 'times' });
+  for (let i = 0; i < 3; i++) add({ kind: 'action', action: 'freeze' });
+  for (let i = 0; i < 3; i++) add({ kind: 'action', action: 'flip3' });
+  for (let i = 0; i < 3; i++) add({ kind: 'action', action: 'second' });
+  return cards;
+}
+
+function f7UniqueCount(p) {
+  return new Set(p.line.filter(c => c.kind === 'number').map(c => c.value)).size;
+}
+function f7HasSecond(p) {
+  return p.line.some(c => c.kind === 'action' && c.action === 'second');
+}
+function f7LineScore(p) {
+  let sum = 0, plus = 0, times = false;
+  for (const c of p.line) {
+    if (c.kind === 'number') sum += c.value;
+    else if (c.kind === 'modifier') { if (c.mod === 'times') times = true; else plus += c.value; }
+  }
+  return (times ? sum * 2 : sum) + plus;
+}
+function f7Worth(p) {
+  if (p.status === 'busted') return 0;
+  if (p.status === 'in') return f7LineScore(p);
+  return p.banked; // banked / frozen: locked-in amount
+}
+
+function f7StateFor(room, viewer) {
+  return {
+    type: 'state',
+    game: 'flip7',
+    version: room.version,
+    code: room.code,
+    phase: room.phase, // lobby | playing | round_end | game_end
+    round: room.round,
+    currentPlayerId: room.currentPlayerId,
+    deckCount: room.stock.length,
+    flipping: room.f7seq.length > 0, // a Flip Three sequence is mid-flight
+    pendingAction: room.pendingAction ? { kind: room.pendingAction.kind, byId: room.pendingAction.byId } : null,
+    you: viewer ? { id: viewer.id } : null,
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      isBot: p.isBot,
+      connected: p.isBot ? true : p.connected,
+      isHost: p.id === room.hostId,
+      isCurrent: p.id === room.currentPlayerId,
+      totalScore: p.totalScore,
+      status: p.status, // in | banked | busted | frozen
+      line: p.line, // every flipped card is public in Flip 7
+      uniqueCount: f7UniqueCount(p),
+      lineScore: f7Worth(p),
+      hasSecondChance: f7HasSecond(p),
+      roundGained: p.roundGained || 0,
+    })),
+    lastRoundResult: room.lastRoundResult,
+    winners: room.winners,
+    lastEvent: room.lastEvent,
+  };
+}
+
+function f7StartRound(room) {
+  room.stock = shuffle(f7CreateDeck());
+  room.f7discard = [];
+  room.f7seq = [];
+  room.pendingAction = null;
+  room.pendingCard = null;
+  room.f7Stage = 'decide';
+  room.flip7PlayerId = null;
+  for (const p of room.players) {
+    p.line = [];
+    p.status = 'in';
+    p.banked = 0;
+    p.roundGained = 0;
+  }
+  // Opening card for everyone: action cards are set aside and replaced so
+  // nobody has to pick a target before the round has even started.
+  for (const p of room.players) {
+    let card = f7Draw(room);
+    while (card && card.kind === 'action') { room.f7discard.push(card); card = f7Draw(room); }
+    if (card) p.line.push(card);
+  }
+  room.phase = 'playing';
+  const starter = room.players[(room.round - 1) % room.players.length];
+  room.currentPlayerId = starter.id;
+  room.lastEvent = 'Round ' + room.round + ' dealt — ' + starter.name + ' to play';
+  broadcast(room);
+  f7Continue(room);
+}
+
+function f7Draw(room) {
+  if (!room.stock.length) {
+    if (!room.f7discard.length) return null;
+    room.stock = shuffle(room.f7discard);
+    room.f7discard = [];
+  }
+  return room.stock.pop();
+}
+
+/* One driver for everything that happens next, so turn flips, Flip Three
+ * sequences, target prompts and bots can never fight over the flow. */
+function f7Continue(room) {
+  if (room.phase !== 'playing') return;
+  if (room.pendingAction) {
+    const by = room.players.find(p => p.id === room.pendingAction.byId);
+    if (by && by.isBot) f7Schedule(room, BOT_DISCARD_DELAY_MS, () => f7BotTarget(room));
+    return;
+  }
+  if (room.f7seq.length) {
+    f7Schedule(room, F7_FLIP_MS, () => f7SeqStep(room));
+    return;
+  }
+  if (room.f7Stage === 'resolving') { f7Advance(room); return; }
+  const p = currentPlayer(room);
+  if (!p || p.status !== 'in') { f7Advance(room); return; }
+  if (p.isBot) f7Schedule(room, BOT_DELAY_MS, () => f7BotDecision(room));
+}
+
+function f7Schedule(room, delay, fn) {
+  if (room.f7Scheduled) return;
+  room.f7Scheduled = true;
+  setTimeout(() => {
+    room.f7Scheduled = false;
+    if (room.phase !== 'playing') return;
+    fn();
+  }, delay);
+}
+
+function f7Advance(room) {
+  const n = room.players.length;
+  const cur = room.players.findIndex(p => p.id === room.currentPlayerId);
+  for (let step = 1; step <= n; step++) {
+    const cand = room.players[(cur + step) % n];
+    if (cand.status === 'in') {
+      room.currentPlayerId = cand.id;
+      room.f7Stage = 'decide';
+      room.lastEvent = cand.name + ' to play';
+      broadcast(room);
+      f7Continue(room);
+      return;
+    }
+  }
+  f7ScoreRound(room);
+}
+
+function f7DoHit(room, player) {
+  if (room.phase !== 'playing') return 'the game is not in play';
+  if (room.pendingAction) return 'choose a target first';
+  if (room.f7seq.length) return 'cards are still flipping';
+  if (currentPlayer(room) !== player) return 'not your turn';
+  if (room.f7Stage !== 'decide') return 'you have already flipped';
+  if (player.status !== 'in') return 'you are out of this round';
+  room.f7Stage = 'resolving';
+  const card = f7Draw(room);
+  if (!card) { f7ScoreRound(room); return null; }
+  f7ResolveDrawn(room, player, card);
+  broadcast(room);
+  f7Continue(room);
+  return null;
+}
+
+function f7DoStay(room, player) {
+  if (room.phase !== 'playing') return 'the game is not in play';
+  if (room.pendingAction) return 'choose a target first';
+  if (room.f7seq.length) return 'cards are still flipping';
+  if (currentPlayer(room) !== player) return 'not your turn';
+  if (room.f7Stage !== 'decide') return 'you have already flipped';
+  if (player.status !== 'in') return 'you are out of this round';
+  player.banked = f7LineScore(player);
+  player.status = 'banked';
+  room.lastEvent = player.name + ' stayed and banked ' + player.banked;
+  broadcast(room);
+  f7Advance(room);
+  return null;
+}
+
+/* Resolve a freshly flipped card for `player`. May set a pending target
+ * prompt (Freeze / Flip Three / a second Second Chance to give away),
+ * bust the player, or end the round (Flip 7). */
+function f7ResolveDrawn(room, player, card) {
+  if (card.kind === 'number') {
+    const dup = player.line.some(c => c.kind === 'number' && c.value === card.value);
+    if (dup) {
+      if (f7HasSecond(player)) {
+        player.line = player.line.filter(c => !(c.kind === 'action' && c.action === 'second'));
+        room.f7discard.push(card);
+        room.lastEvent = player.name + ' flipped a duplicate ' + card.value + ' — Second Chance saved them';
+        return;
+      }
+      player.status = 'busted';
+      room.lastEvent = player.name + ' flipped a duplicate ' + card.value + ' and busted';
+      return;
+    }
+    player.line.push(card);
+    room.lastEvent = player.name + ' flipped ' + card.value;
+    if (f7UniqueCount(player) >= 7) {
+      player.banked = f7LineScore(player) + 15;
+      player.status = 'banked';
+      room.flip7PlayerId = player.id;
+      for (const p of room.players) {
+        if (p.status === 'in') { p.banked = f7LineScore(p); p.status = 'banked'; }
+      }
+      room.lastEvent = player.name + ' flipped 7 unique numbers — Flip 7! +15';
+      f7ScoreRound(room);
+    }
+    return;
+  }
+  if (card.kind === 'modifier') {
+    player.line.push(card);
+    room.lastEvent = player.name + ' flipped ' + (card.mod === 'times' ? '×2' : '+' + card.value);
+    return;
+  }
+  // Action cards.
+  if (card.action === 'second') {
+    if (!f7HasSecond(player)) {
+      player.line.push(card);
+      room.lastEvent = player.name + ' picked up a Second Chance';
+      return;
+    }
+    // Already holding one: it must be given to another player still in
+    // the round who hasn't got one — or discarded if there is nobody.
+    const takers = room.players.filter(p => p !== player && p.status === 'in' && !f7HasSecond(p));
+    if (!takers.length) {
+      room.f7discard.push(card);
+      room.lastEvent = player.name + ' flipped a Second Chance but already had one';
+      return;
+    }
+    room.pendingAction = { kind: 'gift', byId: player.id };
+    room.pendingCard = card;
+    room.lastEvent = player.name + ' must give away a Second Chance';
+    return;
+  }
+  room.pendingAction = { kind: card.action, byId: player.id }; // freeze | flip3
+  room.pendingCard = card;
+  room.lastEvent = player.name + ' flipped ' + (card.action === 'freeze' ? 'Freeze — choose who banks now' : 'Flip Three — choose who flips 3');
+}
+
+function f7ApplyTarget(room, player, targetId) {
+  if (room.phase !== 'playing') return 'the game is not in play';
+  if (!room.pendingAction) return 'nothing needs a target';
+  if (room.pendingAction.byId !== player.id) return 'someone else is choosing a target';
+  const target = room.players.find(p => p.id === targetId);
+  if (!target) return 'choose a player';
+  const kind = room.pendingAction.kind;
+  const card = room.pendingCard;
+  if (kind === 'gift') {
+    if (target === player || target.status !== 'in' || f7HasSecond(target)) {
+      return 'choose a player still in the round without a Second Chance';
+    }
+    target.line.push(card);
+    room.lastEvent = player.name + ' gave a Second Chance to ' + target.name;
+  } else {
+    if (target.status !== 'in') return 'choose a player still in the round';
+    room.f7discard.push(card);
+    if (kind === 'freeze') {
+      target.banked = f7LineScore(target);
+      target.status = 'frozen';
+      room.f7seq = room.f7seq.filter(s => s.playerId !== target.id);
+      room.lastEvent = target.name + ' was frozen and banked ' + target.banked;
+    } else { // flip3
+      room.f7seq.push({ playerId: target.id, left: 3 });
+      room.lastEvent = target.name + ' must flip three';
+    }
+  }
+  room.pendingAction = null;
+  room.pendingCard = null;
+  broadcast(room);
+  f7Continue(room);
+  return null;
+}
+
+function f7SeqStep(room) {
+  const top = room.f7seq[room.f7seq.length - 1];
+  if (!top) { f7Continue(room); return; }
+  const p = room.players.find(x => x.id === top.playerId);
+  if (!p || p.status !== 'in') {
+    room.f7seq = room.f7seq.filter(s => s !== top);
+    f7Continue(room);
+    return;
+  }
+  const card = f7Draw(room);
+  if (!card) { f7ScoreRound(room); return; }
+  top.left--;
+  f7ResolveDrawn(room, p, card);
+  if (room.phase !== 'playing') return; // Flip 7 ended the round mid-sequence
+  if (p.status !== 'in') room.f7seq = room.f7seq.filter(s => s.playerId !== p.id);
+  else if (top.left <= 0) room.f7seq = room.f7seq.filter(s => s !== top);
+  broadcast(room);
+  f7Continue(room);
+}
+
+function f7ScoreRound(room) {
+  room.phase = 'round_end';
+  room.f7seq = [];
+  room.pendingAction = null;
+  room.pendingCard = null;
+  const results = room.players.map(p => {
+    const gained = p.status === 'busted' ? 0
+      : p.status === 'in' ? f7LineScore(p) : p.banked;
+    p.roundGained = gained;
+    p.totalScore += gained;
+    if (p.status === 'in') { p.banked = gained; p.status = 'banked'; }
+    return { playerId: p.id, name: p.name, gained, total: p.totalScore, status: p.status };
+  });
+  room.lastRoundResult = { round: room.round, flip7PlayerId: room.flip7PlayerId, results };
+  broadcastEvent(room, 'round_scored', room.lastRoundResult);
+  broadcast(room);
+  setTimeout(() => {
+    if (room.phase !== 'round_end') return;
+    const top = Math.max(...room.players.map(p => p.totalScore));
+    if (top >= 200) {
+      room.phase = 'game_end';
+      room.winners = room.players.filter(p => p.totalScore === top).map(p => p.id);
+      room.lastEvent = 'Game over';
+      broadcastEvent(room, 'game_over', { winners: room.winners });
+      broadcast(room);
+    } else {
+      room.round++;
+      f7StartRound(room);
+    }
+  }, ROUND_DELAY_MS);
+}
+
+/* Flip 7 bots: flip while the score is small or the line is short; stay
+ * once the points are worth banking. Freeze the biggest threat, Flip
+ * Three onto whoever is closest to busting (or themselves early). */
+function f7BotDecision(room) {
+  const p = currentPlayer(room);
+  if (!p || !p.isBot || p.status !== 'in' || room.f7Stage !== 'decide') return;
+  if (room.pendingAction || room.f7seq.length) return;
+  const score = f7LineScore(p);
+  const uniques = f7UniqueCount(p);
+  const stay = score >= 24 || uniques >= 5 || (score >= 16 && uniques >= 4);
+  if (stay) f7DoStay(room, p);
+  else f7DoHit(room, p);
+}
+
+function f7BotTarget(room) {
+  const pending = room.pendingAction;
+  if (!pending) return;
+  const bot = room.players.find(p => p.id === pending.byId);
+  if (!bot || !bot.isBot) return;
+  let target = null;
+  if (pending.kind === 'freeze') {
+    const inPlay = room.players.filter(p => p.status === 'in');
+    target = inPlay.sort((a, b) => f7LineScore(b) - f7LineScore(a))[0];
+  } else if (pending.kind === 'flip3') {
+    if (f7UniqueCount(bot) <= 1) target = bot;
+    else {
+      const others = room.players.filter(p => p !== bot && p.status === 'in');
+      target = others.length
+        ? others.sort((a, b) => f7UniqueCount(b) - f7UniqueCount(a))[0]
+        : bot;
+    }
+  } else if (pending.kind === 'gift') {
+    const takers = room.players.filter(p => p !== bot && p.status === 'in' && !f7HasSecond(p));
+    target = takers.sort((a, b) => f7LineScore(a) - f7LineScore(b))[0];
+  }
+  if (target) f7ApplyTarget(room, bot, target.id);
+}
+
+/* ------------------------------------------------------------------ */
 /* HTTP + WebSocket server                                             */
 /* ------------------------------------------------------------------ */
 function startServer(port) {
@@ -580,11 +970,17 @@ function startServer(port) {
           if (!name) return fail('a display name is required');
           room = {
             code: makeCode(), hostId: null, players: [], phase: 'lobby',
+            game: msg.game === 'flip7' ? 'flip7' : 'fivecrowns',
             round: 1, wildRank: null, stock: [], discard: [],
             currentPlayerId: null, turnPhase: 'draw', turnCount: 0,
             outPlayerId: null, finalPending: null, reshuffles: 0,
             lastRoundResult: null, winners: null, lastEvent: 'Room created',
             version: 0, botScheduled: false,
+            // Flip 7 state (unused in Five Crowns rooms). The flip deck
+            // lives in room.stock; f7discard is its reshuffle pile.
+            f7seq: [], pendingAction: null, pendingCard: null,
+            f7Stage: 'decide', f7Scheduled: false, flip7PlayerId: null,
+            f7discard: [],
           };
           me = makePlayer(name, false);
           me.ws = ws; me.connected = true;
@@ -640,24 +1036,49 @@ function startServer(port) {
           room.round = 1;
           room.lastRoundResult = null;
           room.winners = null;
-          startRound(room);
+          if (room.game === 'flip7') f7StartRound(room);
+          else startRound(room);
           break;
         }
         case 'draw': {
           if (!room || !me) return fail('join a room first');
+          if (room.game !== 'fivecrowns') return fail('that move is for Five Crowns');
           const err = doDraw(room, me, msg.source === 'discard' ? 'discard' : 'stock');
           if (err) fail(err);
           break;
         }
         case 'go_out': {
           if (!room || !me) return fail('join a room first');
+          if (room.game !== 'fivecrowns') return fail('that move is for Five Crowns');
           const err = doGoOut(room, me, msg.groups, msg.discardId);
           if (err) fail(err);
           break;
         }
         case 'discard': {
           if (!room || !me) return fail('join a room first');
+          if (room.game !== 'fivecrowns') return fail('that move is for Five Crowns');
           const err = doDiscard(room, me, msg.cardId);
+          if (err) fail(err);
+          break;
+        }
+        case 'f7_hit': {
+          if (!room || !me) return fail('join a room first');
+          if (room.game !== 'flip7') return fail('that move is for Flip 7');
+          const err = f7DoHit(room, me);
+          if (err) fail(err);
+          break;
+        }
+        case 'f7_stay': {
+          if (!room || !me) return fail('join a room first');
+          if (room.game !== 'flip7') return fail('that move is for Flip 7');
+          const err = f7DoStay(room, me);
+          if (err) fail(err);
+          break;
+        }
+        case 'f7_target': {
+          if (!room || !me) return fail('join a room first');
+          if (room.game !== 'flip7') return fail('that move is for Flip 7');
+          const err = f7ApplyTarget(room, me, String(msg.targetId || ''));
           if (err) fail(err);
           break;
         }
@@ -681,7 +1102,8 @@ function startServer(port) {
         me.isBot = true;
         room.lastEvent = me.name + ' disconnected — a bot has taken their seat';
         broadcast(room);
-        scheduleBot(room);
+        if (room.game === 'flip7') f7Continue(room);
+        else scheduleBot(room);
       }
     });
   });
@@ -696,4 +1118,5 @@ if (require.main === module) startServer(PORT);
 
 module.exports = {
   createDeck, validateMeld, findMelds, tryOut, chooseDiscard, deadwoodValue, handScore, isWild, startServer,
+  f7CreateDeck, f7LineScore, f7UniqueCount,
 };
