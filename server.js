@@ -12,6 +12,7 @@
  * Test: npm test             (see test.js)
  */
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
@@ -376,6 +377,7 @@ function scoreRound(room) {
       room.phase = 'game_end';
       const best = Math.min(...room.players.map(p => p.totalScore));
       room.winners = room.players.filter(p => p.totalScore === best).map(p => p.id);
+      recordGameResult(room, 'Five Crowns');
       room.lastEvent = 'Game over';
       broadcastEvent(room, 'game_over', {
         winners: room.winners,
@@ -403,6 +405,7 @@ function startRound(room) {
   room.finalPending = null;
   room.reshuffles = 0;
   room.phase = 'playing';
+  if (room.round === 1) room.scoreRecorded = false;
   room.lastEvent = 'Round ' + room.round + ' dealt — ' + (RANK_LABEL[room.wildRank] || room.wildRank) + 's are wild';
   const first = room.players[(room.round - 1) % room.players.length];
   room.currentPlayerId = first.id;
@@ -657,6 +660,7 @@ function f7StartRound(room) {
   // No opening deal — matching the offline game, your first turn is your
   // first flip. Everyone starts the round with an empty line.
   room.phase = 'playing';
+  if (room.round === 1) room.scoreRecorded = false;
   const starter = room.players[(room.round - 1) % room.players.length];
   room.currentPlayerId = starter.id;
   room.lastEvent = 'Round ' + room.round + ' dealt — ' + starter.name + ' to play';
@@ -907,6 +911,7 @@ function f7ScoreRound(room) {
     if (top >= 200) {
       room.phase = 'game_end';
       room.winners = room.players.filter(p => p.totalScore === top).map(p => p.id);
+      recordGameResult(room, 'Flip 7');
       room.lastEvent = 'Game over';
       broadcastEvent(room, 'game_over', { winners: room.winners });
       broadcast(room);
@@ -956,11 +961,157 @@ function f7BotTarget(room) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Shared ElMunBut score table                                         */
+/*                                                                     */
+/* One synced table for the whole crew (Matthew, 15 Nov 2026): every   */
+/* finished online game is recorded here by the server itself, and     */
+/* manual Score Card entries are posted here by the app, so the tally  */
+/* everyone sees matches regardless of who played or whose phone       */
+/* entered it. Entry: {id, ts, game, source, players:[{name,score}],   */
+/* winners:[name]}. The durable copy is scores.json in the             */
+/* elmunbut-games GitHub repo, written via the GitHub API when         */
+/* GITHUB_TOKEN is set (Render env var); without a token the table     */
+/* still works in memory for the life of the process.                  */
+/* ------------------------------------------------------------------ */
+const SCORES_REPO = 'ma77y111-spec/elmunbut-games';
+const SCORES_PATH = 'scores.json';
+const SCORES_KEY = 'elmunbut'; // crew word the app sends with manual posts; deters casual spam, nothing more
+let SCORES = [];
+let scoresSha = null;
+let scoresPersistTimer = null;
+let scoresPersisting = false;
+let scoresDirty = false;
+
+function ghApi(method, apiPath, body) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = https.request({
+      hostname: 'api.github.com', path: apiPath, method,
+      headers: {
+        'User-Agent': 'elmunbut-server',
+        'Accept': 'application/vnd.github+json',
+        ...(process.env.GITHUB_TOKEN ? { Authorization: 'Bearer ' + process.env.GITHUB_TOKEN } : {}),
+        ...(data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {}),
+      },
+    }, res => {
+      let buf = '';
+      res.on('data', d => { buf += d; });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve(buf ? JSON.parse(buf) : {}); } catch { resolve({}); }
+        } else reject(new Error('GitHub ' + method + ' ' + apiPath + ' -> ' + res.statusCode));
+      });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function loadScores() {
+  try {
+    const file = await ghApi('GET', '/repos/' + SCORES_REPO + '/contents/' + SCORES_PATH);
+    const parsed = JSON.parse(Buffer.from(file.content || '', 'base64').toString('utf8'));
+    if (Array.isArray(parsed)) { SCORES = parsed; scoresSha = file.sha || null; }
+    console.log('scores: loaded ' + SCORES.length + ' entries from GitHub');
+  } catch (err) {
+    console.log('scores: starting empty (' + err.message + ')');
+  }
+}
+
+function persistScores() {
+  if (!process.env.GITHUB_TOKEN) return; // in-memory only until the token is set
+  scoresDirty = true;
+  if (scoresPersistTimer) return;
+  scoresPersistTimer = setTimeout(async () => {
+    scoresPersistTimer = null;
+    if (scoresPersisting || !scoresDirty) return;
+    scoresPersisting = true; scoresDirty = false;
+    try {
+      if (!scoresSha) {
+        try {
+          const file = await ghApi('GET', '/repos/' + SCORES_REPO + '/contents/' + SCORES_PATH);
+          scoresSha = file.sha || null;
+        } catch { scoresSha = null; }
+      }
+      const content = Buffer.from(JSON.stringify(SCORES, null, 2)).toString('base64');
+      const out = await ghApi('PUT', '/repos/' + SCORES_REPO + '/contents/' + SCORES_PATH, {
+        message: 'scores: update shared table', content, ...(scoresSha ? { sha: scoresSha } : {}),
+      });
+      if (out && out.content) scoresSha = out.content.sha;
+      console.log('scores: persisted ' + SCORES.length + ' entries');
+    } catch (err) {
+      console.log('scores: persist failed (' + err.message + ')');
+      scoresDirty = true;
+    }
+    scoresPersisting = false;
+    if (scoresDirty) persistScores();
+  }, 3000);
+}
+
+function recordScore(entry) {
+  const clean = {
+    id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+    ts: Date.now(),
+    game: String(entry.game || ''),
+    source: entry.source || 'online',
+    players: (entry.players || []).map(p => ({ name: String(p.name || '').slice(0, 24), score: Number(p.score) || 0 })),
+    winners: (entry.winners || []).map(n => String(n).slice(0, 24)),
+  };
+  if (!clean.game || !clean.players.length) return null;
+  SCORES.push(clean);
+  persistScores();
+  return clean;
+}
+
+function recordGameResult(room, gameLabel) {
+  if (room.scoreRecorded) return;
+  room.scoreRecorded = true;
+  recordScore({
+    game: gameLabel, source: 'online',
+    players: room.players.map(p => ({ name: p.name, score: p.totalScore })),
+    winners: room.players.filter(p => (room.winners || []).includes(p.id)).map(p => p.name),
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* HTTP + WebSocket server                                             */
 /* ------------------------------------------------------------------ */
 function startServer(port) {
   const server = http.createServer((req, res) => {
     if (req.url === '/healthz') { res.writeHead(200); res.end('ok'); return; }
+    if (req.url === '/scores' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ entries: SCORES }));
+      return;
+    }
+    if ((req.url === '/scores/manual' || req.url === '/scores/delete') && req.method === 'OPTIONS') {
+      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'Content-Type' });
+      res.end();
+      return;
+    }
+    if ((req.url === '/scores/manual' || req.url === '/scores/delete') && req.method === 'POST') {
+      let buf = '';
+      req.on('data', d => { buf += d; if (buf.length > 65536) req.destroy(); });
+      req.on('end', () => {
+        let msg = null;
+        try { msg = JSON.parse(buf); } catch { /* handled below */ }
+        if (!msg || msg.key !== SCORES_KEY) { res.writeHead(403, { 'Access-Control-Allow-Origin': '*' }); res.end('forbidden'); return; }
+        if (req.url === '/scores/delete') {
+          const before = SCORES.length;
+          SCORES = SCORES.filter(e => e.id !== String(msg.id || ''));
+          if (SCORES.length !== before) persistScores();
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ ok: true, removed: before - SCORES.length }));
+          return;
+        }
+        const saved = recordScore({ game: String(msg.game || ''), source: 'manual', players: msg.players, winners: msg.winners });
+        if (!saved) { res.writeHead(400, { 'Access-Control-Allow-Origin': '*' }); res.end('bad entry'); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ ok: true, entry: saved }));
+      });
+      return;
+    }
     if (req.url === '/' || req.url === '/index.html') {
       const file = path.join(__dirname, 'public', 'index.html');
       fs.readFile(file, (err, data) => {
@@ -1001,7 +1152,7 @@ function startServer(port) {
             // lives in room.stock; f7discard is its reshuffle pile.
             f7seq: [], pendingAction: null, pendingCard: null,
             f7Stage: 'decide', f7Scheduled: false, flip7PlayerId: null,
-            f7discard: [], f7Ending: false,
+            f7discard: [], f7Ending: false, scoreRecorded: false,
           };
           me = makePlayer(name, false);
           me.ws = ws; me.connected = true;
@@ -1131,6 +1282,7 @@ function startServer(port) {
 
   server.listen(port, () => {
     console.log('Five Crowns multiplayer server listening on port ' + port);
+    loadScores();
   });
   return server;
 }
