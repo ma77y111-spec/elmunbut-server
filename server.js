@@ -17,7 +17,8 @@ const path = require('path');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const BOT_DELAY_MS = Number(process.env.BOT_DELAY_MS || 600);
+const BOT_DELAY_MS = Number(process.env.BOT_DELAY_MS || 1100);
+const BOT_DISCARD_DELAY_MS = Number(process.env.BOT_DISCARD_DELAY_MS || 900);
 const ROUND_DELAY_MS = Number(process.env.ROUND_DELAY_MS || 3000);
 const MAX_RESHUFFLES = 2; // backstop: after this many stock reshuffles a round is scored as-is
 
@@ -500,15 +501,28 @@ function scheduleBot(room) {
   setTimeout(() => {
     room.botScheduled = false;
     if (room.phase !== 'playing' || currentPlayer(room) !== p) return;
-    botTakeTurn(room, p);
+    botDrawStep(room, p);
   }, BOT_DELAY_MS);
 }
 
-function botTakeTurn(room, player) {
+/* Bot turns run in two beats so the table can follow them (Matthew,
+ * 15 Nov 2026: bots were "operating instantly"): draw first, pause,
+ * then discard or go out. */
+function botDrawStep(room, player) {
   if (room.turnPhase === 'draw') {
     doDraw(room, player, chooseDrawSource(room, player));
     if (room.phase !== 'playing' || currentPlayer(room) !== player) return;
   }
+  if (room.phase !== 'playing' || currentPlayer(room) !== player || room.turnPhase !== 'play') return;
+  room.botScheduled = true;
+  setTimeout(() => {
+    room.botScheduled = false;
+    if (room.phase !== 'playing' || currentPlayer(room) !== player) return;
+    botPlayStep(room, player);
+  }, BOT_DISCARD_DELAY_MS);
+}
+
+function botPlayStep(room, player) {
   const out = tryOut(player.hand, room.wildRank);
   if (out) {
     if (out.discard) {
