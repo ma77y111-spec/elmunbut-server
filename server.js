@@ -653,7 +653,21 @@ function f7StateFor(room, viewer) {
 }
 
 function f7StartRound(room) {
-  room.stock = shuffle(f7CreateDeck());
+  if (!Array.isArray(room.f7Used)) room.f7Used = [];
+  if (room.round === 1 || !room.f7DeckInPlay) {
+    // A new game always starts from a fresh, full deck.
+    room.stock = shuffle(f7CreateDeck());
+    room.f7Used = [];
+    room.f7DeckInPlay = true;
+  } else {
+    // Play the deck in full (Matthew, 16 Nov 2026): no fresh deck each
+    // round. Cards flipped in earlier rounds move to the used pile and
+    // stay out of circulation; the round starts from what is left of
+    // the stock, and the used pile is only shuffled back in when the
+    // stock runs dry (see f7Draw).
+    for (const p of room.players) room.f7Used.push(...p.line);
+    room.f7Used.push(...room.f7discard);
+  }
   room.f7discard = [];
   room.f7seq = [];
   room.pendingAction = null;
@@ -680,9 +694,18 @@ function f7StartRound(room) {
 
 function f7Draw(room) {
   if (!room.stock.length) {
-    if (!room.f7discard.length) return null;
-    room.stock = shuffle(room.f7discard);
+    // Stock ran dry mid-round: the used pile (earlier rounds' cards)
+    // plus this round's discards shuffle back in. Cards currently in
+    // players' lines are never part of the recycle.
+    const back = [...(room.f7Used || []), ...room.f7discard];
+    if (!back.length) return null;
+    room.stock = shuffle(back);
+    room.f7Used = [];
     room.f7discard = [];
+    // Tell the table the shuffled deck has been applied (Matthew,
+    // 16 Nov 2026): clients pop up a "deck shuffled" notification.
+    room.lastEvent = 'Deck shuffled — used cards are back in';
+    broadcastEvent(room, 'deck_shuffled', {});
   }
   return room.stock.pop();
 }
@@ -1218,6 +1241,7 @@ function startServer(port) {
             f7seq: [], pendingAction: null, pendingCard: null,
             f7Stage: 'decide', f7Scheduled: false, flip7PlayerId: null,
             f7discard: [], f7Ending: false, scoreRecorded: false,
+            f7Used: [], f7DeckInPlay: false,
           };
           me = makePlayer(name, false);
           me.ws = ws; me.connected = true;
