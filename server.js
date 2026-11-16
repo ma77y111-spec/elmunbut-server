@@ -33,6 +33,12 @@ const MAX_RESHUFFLES = 2; // backstop: after this many stock reshuffles a round 
 const SUITS = ['stars', 'hearts', 'spades', 'clubs', 'diamonds'];
 const RANK_LABEL = { 11: 'J', 12: 'Q', 13: 'K' };
 const BOT_NAMES = ['Millard', 'Discoveray', 'Expanda', 'Invy', 'Warbie'];
+/* How long a disconnected human's seat is held for rejoin before it is
+   given up (lobby/game-end seat removed; mid-game seat stays a bot).
+   Phones drop the socket when the app is backgrounded (e.g. the player
+   switches to Messenger to send the room code), so this must comfortably
+   cover a few minutes away. Env override exists for tests. */
+const REJOIN_GRACE_MS = Number(process.env.REJOIN_GRACE_MS) || 300000;
 
 function createDeck() {
   const cards = [];
@@ -262,6 +268,10 @@ function makePlayer(name, isBot) {
   return {
     id: 'p' + (++playerSeq) + Math.random().toString(36).slice(2, 7),
     name, isBot: !!isBot, connected: false, ws: null,
+    // Reconnect support (Matthew, 16 Nov 2026): a human seat survives a
+    // dropped connection for a grace period so the player can rejoin.
+    // botCover = a bot is playing this human's seat while they are away.
+    humanSeat: !isBot, botCover: false, reclaimable: true, disconnectTimer: null,
     hand: [], groups: [], totalScore: 0,
     // Flip 7 per-round state (unused in Five Crowns rooms).
     line: [], status: 'in', banked: 0, roundGained: 0,
@@ -1072,7 +1082,7 @@ function recordGameResult(room, gameLabel) {
      are tallied. A room with fewer than 2 human players is a bot game
      (solo practice via an online room), so it is never recorded. Rooms
      with 2+ humans are recorded in full, including any bot fill-ins. */
-  const humans = room.players.filter(p => !p.isBot);
+  const humans = room.players.filter(p => p.humanSeat);
   if (humans.length < 2) return;
   recordScore({
     game: gameLabel, source: 'online',
@@ -1131,6 +1141,54 @@ function startServer(port) {
     res.writeHead(404); res.end('not found');
   });
 
+  /* Reconnect helpers. holdSeat starts the grace clock when a human's
+     socket drops; expireSeat gives the seat up when it runs out;
+     reclaimSeat binds a fresh socket back onto a held seat. */
+  function expireSeat(roomRef, player) {
+    player.disconnectTimer = null;
+    if (player.connected) return;
+    if (roomRef.phase === 'lobby' || roomRef.phase === 'game_end') {
+      roomRef.players = roomRef.players.filter(p => p !== player);
+      if (!roomRef.players.length) { rooms.delete(roomRef.code); return; }
+      if (roomRef.hostId === player.id) {
+        const next = roomRef.players.find(p => p.humanSeat) || roomRef.players[0];
+        roomRef.hostId = next.id;
+      }
+      roomRef.lastEvent = player.name + ' left';
+      broadcast(roomRef);
+    } else {
+      // Mid-game the bot keeps the seat for good; it just can't be
+      // reclaimed any more. Make sure the bot is actually covering it
+      // (the seat may have been held from the lobby when the game
+      // started) and that play moves forward.
+      player.reclaimable = false;
+      if (player.humanSeat && !player.isBot) {
+        player.botCover = true;
+        player.isBot = true;
+        broadcast(roomRef);
+        if (roomRef.game === 'flip7') f7Continue(roomRef);
+        else scheduleBot(roomRef);
+      }
+    }
+  }
+  function holdSeat(roomRef, player) {
+    if (player.disconnectTimer) clearTimeout(player.disconnectTimer);
+    player.disconnectTimer = setTimeout(() => expireSeat(roomRef, player), REJOIN_GRACE_MS);
+    if (player.disconnectTimer.unref) player.disconnectTimer.unref();
+  }
+  function reclaimSeat(roomRef, player, socket) {
+    if (player.disconnectTimer) { clearTimeout(player.disconnectTimer); player.disconnectTimer = null; }
+    player.ws = socket;
+    player.connected = true;
+    if (player.botCover) { player.botCover = false; player.isBot = false; }
+    roomRef.lastEvent = player.name + ' reconnected';
+    send(socket, { type: 'room_joined', code: roomRef.code, playerId: player.id });
+    broadcast(roomRef);
+  }
+  function findReclaimable(roomRef, pred) {
+    return roomRef.players.find(p => p.humanSeat && p.reclaimable && (!p.connected || p.botCover) && pred(p)) || null;
+  }
+
   const wss = new WebSocketServer({ server });
 
   wss.on('connection', ws => {
@@ -1170,12 +1228,53 @@ function startServer(port) {
           broadcast(room);
           break;
         }
+        case 'list_rooms': {
+          // Open games list (Matthew, 16 Nov 2026): lobby rooms waiting
+          // for players, so the crew can join straight from the page
+          // without swapping to a messenger app for the room code.
+          const gameFilter = msg.game === 'flip7' ? 'flip7' : (msg.game === 'fivecrowns' ? 'fivecrowns' : null);
+          const open = [];
+          for (const r of rooms.values()) {
+            if (r.phase !== 'lobby' || r.players.length >= 6) continue;
+            if (gameFilter && r.game !== gameFilter) continue;
+            const host = r.players.find(p => p.id === r.hostId);
+            open.push({
+              code: r.code, game: r.game,
+              host: host ? host.name : '',
+              players: r.players.map(p => p.name),
+              seatsFree: 6 - r.players.length,
+            });
+          }
+          send(ws, { type: 'rooms_list', rooms: open });
+          break;
+        }
+        case 'rejoin_room': {
+          if (me) return fail('you are already in a room');
+          const target = rooms.get(String(msg.code || '').trim().toUpperCase());
+          if (!target) return fail('no room with that code');
+          const seat = findReclaimable(target, p => p.id === String(msg.playerId || ''));
+          if (!seat) return fail('that seat is no longer available');
+          room = target;
+          me = seat;
+          reclaimSeat(room, me, ws);
+          break;
+        }
         case 'join_room': {
           if (me) return fail('you are already in a room');
           const name = String(msg.name || '').trim().slice(0, 24);
           if (!name) return fail('a display name is required');
           const target = rooms.get(String(msg.code || '').trim().toUpperCase());
           if (!target) return fail('no room with that code');
+          // A player coming back (app was backgrounded, socket dropped)
+          // reclaims their held seat by name instead of joining twice —
+          // this works mid-game too, where a fresh join is refused.
+          const held = findReclaimable(target, p => p.name === name);
+          if (held) {
+            room = target;
+            me = held;
+            reclaimSeat(room, me, ws);
+            break;
+          }
           if (target.phase !== 'lobby') return fail('that game has already started');
           if (target.players.length >= 6) return fail('that room is full');
           room = target;
@@ -1212,6 +1311,11 @@ function startServer(port) {
           }
           if (room.players.length < 2) return fail('need at least 2 seats filled to start');
           for (const p of room.players) p.totalScore = 0;
+          // A human whose socket dropped in the lobby (seat held) starts
+          // the game covered by a bot; they can reclaim the seat mid-game.
+          for (const p of room.players) {
+            if (p.humanSeat && !p.connected) { p.botCover = true; p.isBot = true; }
+          }
           room.round = 1;
           room.lastRoundResult = null;
           room.winners = null;
@@ -1268,18 +1372,25 @@ function startServer(port) {
 
     ws.on('close', () => {
       if (!room || !me) return;
+      // Only the socket currently bound to the seat counts; a stale
+      // socket closing after a rejoin must not drop the player again.
+      if (me.ws !== ws) return;
       me.connected = false;
       me.ws = null;
-      if (room.phase === 'lobby') {
-        room.players = room.players.filter(p => p !== me);
-        if (!room.players.length) { rooms.delete(room.code); return; }
-        if (room.hostId === me.id) room.hostId = room.players[0].id;
-        room.lastEvent = me.name + ' left';
+      if (room.phase === 'lobby' || room.phase === 'game_end') {
+        // Hold the seat for the grace period — phones drop the socket
+        // when the app is backgrounded, and the player usually comes
+        // straight back (e.g. after sending the room code by message).
+        holdSeat(room, me);
+        room.lastEvent = me.name + ' disconnected — seat held, they can rejoin';
         broadcast(room);
       } else {
-        // Mid-game: a bot takes over the seat so the game can finish.
+        // Mid-game: a bot covers the seat so the game can continue, but
+        // the human can still reclaim it within the grace period.
+        me.botCover = true;
         me.isBot = true;
-        room.lastEvent = me.name + ' disconnected — a bot has taken their seat';
+        holdSeat(room, me);
+        room.lastEvent = me.name + ' disconnected — a bot is covering their seat, they can rejoin';
         broadcast(room);
         if (room.game === 'flip7') f7Continue(room);
         else scheduleBot(room);
