@@ -1111,9 +1111,34 @@ function presentedToken(msg, ws) {
   return String((msg && msg.token) || (ws && ws.identityToken) || '');
 }
 
-function heldSeatForToken(token) {
+/* Find a user's existing seat: by identity token when one is
+   presented, otherwise by name — but a name match only counts when
+   the seat is not bound to a different remembered identity. Used to
+   stop duplicate rooms/seats when the app glitches or is reopened,
+   and to auto-place a player back into their game when they pick
+   that game in the app (Matthew, 16 Nov 2026). */
+function findUserSeat(game, identityToken, name) {
   for (const r of rooms.values()) {
-    const seat = r.players.find(p => p.humanSeat && p.identityToken === token && p.reclaimable && (!p.connected || p.botCover));
+    if (game && r.game !== game) continue;
+    const seat = r.players.find(p => {
+      if (!p.humanSeat || !p.reclaimable) return false;
+      if (identityToken && p.identityToken === identityToken) return true;
+      return !!name && p.name.toLowerCase() === name.toLowerCase()
+        && (!p.identityToken || p.identityToken === identityToken);
+    });
+    if (seat) return { room: r, seat };
+  }
+  return null;
+}
+
+function heldSeatForToken(token) {
+  // The token proves this is the same device, so the seat counts as
+  // held even if its old socket still looks connected — a backgrounded
+  // phone often leaves a zombie socket the server has not seen close
+  // yet, and treating the seat as taken created duplicate seats
+  // (Matthew, 16 Nov 2026: two of the same player in one room).
+  for (const r of rooms.values()) {
+    const seat = r.players.find(p => p.humanSeat && p.identityToken === token && p.reclaimable);
     if (seat) return { room: r, seat };
   }
   return null;
@@ -1124,12 +1149,21 @@ async function loadIdentities() {
     const file = await ghApi('GET', '/repos/' + SCORES_REPO + '/contents/' + IDENT_PATH);
     const parsed = JSON.parse(Buffer.from(file.content || '', 'base64').toString('utf8'));
     if (Array.isArray(parsed)) {
-      IDENTITIES.clear(); tokenByName.clear();
+      const merged = new Map();
       for (const rec of parsed) {
         if (rec && rec.token && rec.name) {
-          IDENTITIES.set(rec.token, { name: rec.name, createdAt: rec.createdAt || 0 });
-          tokenByName.set(String(rec.name).toLowerCase(), rec.token);
+          merged.set(rec.token, { name: rec.name, createdAt: rec.createdAt || 0 });
         }
+      }
+      // Keep identities issued since startup that the stored file
+      // does not know about yet (their persist may still be in
+      // flight) — a slow load must never wipe a token a device was
+      // just handed.
+      for (const [tok, rec] of IDENTITIES) if (!merged.has(tok)) merged.set(tok, rec);
+      IDENTITIES.clear(); tokenByName.clear();
+      for (const [tok, rec] of merged) {
+        IDENTITIES.set(tok, rec);
+        tokenByName.set(String(rec.name).toLowerCase(), tok);
       }
       identSha = file.sha || null;
     }
@@ -1270,7 +1304,13 @@ function startServer(port) {
       roomRef.players = roomRef.players.filter(p => p !== player);
       if (!roomRef.players.length) { rooms.delete(roomRef.code); return; }
       if (roomRef.hostId === player.id) {
-        const next = roomRef.players.find(p => p.humanSeat) || roomRef.players[0];
+        // A bot must never host a room a person created (Matthew,
+        // 16 Nov 2026): host passes to a human seat only — a present
+        // one first — and if only bots are left the room closes
+        // instead of leaving a bot in charge.
+        const humans = roomRef.players.filter(p => p.humanSeat);
+        const next = humans.find(p => p.connected && !p.botCover) || humans.find(p => !p.botCover) || humans[0];
+        if (!next) { rooms.delete(roomRef.code); return; }
         roomRef.hostId = next.id;
       }
       roomRef.lastEvent = player.name + ' left';
@@ -1281,6 +1321,13 @@ function startServer(port) {
       // (the seat may have been held from the lobby when the game
       // started) and that play moves forward.
       player.reclaimable = false;
+      // If the departing host's seat is now a bot for good, hand host
+      // to another human seat so a person stays in charge of the room.
+      if (roomRef.hostId === player.id) {
+        const next = roomRef.players.find(p => p !== player && p.humanSeat && !p.botCover)
+          || roomRef.players.find(p => p !== player && p.humanSeat);
+        if (next) roomRef.hostId = next.id;
+      }
       if (player.humanSeat && !player.isBot) {
         player.botCover = true;
         player.isBot = true;
@@ -1296,17 +1343,29 @@ function startServer(port) {
     if (player.disconnectTimer.unref) player.disconnectTimer.unref();
   }
   function reclaimSeat(roomRef, player, socket) {
+    const oldWs = player.ws;
     if (player.disconnectTimer) { clearTimeout(player.disconnectTimer); player.disconnectTimer = null; }
     player.ws = socket;
     player.connected = true;
+    // One seat per user per room: if the seat's previous socket is
+    // still hanging around (zombie from a backgrounded app), close it
+    // so the newest connection is the only one bound to the seat. Its
+    // close handler sees the seat is bound to a different socket and
+    // leaves the seat alone.
+    if (oldWs && oldWs !== socket) { try { oldWs.close(); } catch { /* already gone */ } }
     if (player.identityToken) socket.identityToken = player.identityToken;
     if (player.botCover) { player.botCover = false; player.isBot = false; }
     roomRef.lastEvent = player.name + ' reconnected';
     send(socket, { type: 'room_joined', code: roomRef.code, playerId: player.id });
     broadcast(roomRef);
   }
-  function findReclaimable(roomRef, pred) {
-    return roomRef.players.find(p => p.humanSeat && p.reclaimable && (!p.connected || p.botCover) && pred(p)) || null;
+  function findReclaimable(roomRef, pred, allowConnected) {
+    // allowConnected: the caller has proven this is the same user
+    // (their seat id, their identity token, or their name on a
+    // name-only seat), so a seat whose old socket has not timed out
+    // yet is still theirs to take back — never a reason to seat them
+    // twice.
+    return roomRef.players.find(p => p.humanSeat && p.reclaimable && (allowConnected || !p.connected || p.botCover) && pred(p)) || null;
   }
 
   const wss = new WebSocketServer({ server });
@@ -1350,6 +1409,30 @@ function startServer(port) {
           }
           break;
         }
+        case 'find_my_room': {
+          // Auto-placement (Matthew, 16 Nov 2026): when a player picks
+          // a game in the app, if they already have a seat in a room
+          // for that game they are put straight back into it — the app
+          // asks here, then rejoins with the seat it is handed.
+          const presented = presentedToken(msg, ws);
+          let identityToken = null;
+          let name = normalisePlayerName(msg.name);
+          if (presented && IDENTITIES.has(presented)) {
+            name = IDENTITIES.get(presented).name;
+            identityToken = presented;
+          }
+          const gameFilter = msg.game === 'flip7' ? 'flip7' : (msg.game === 'fivecrowns' ? 'fivecrowns' : null);
+          const found = (identityToken || name) ? findUserSeat(gameFilter, identityToken, name) : null;
+          send(ws, {
+            type: 'my_room', game: gameFilter,
+            found: found ? {
+              code: found.room.code, game: found.room.game,
+              playerId: found.seat.id, phase: found.room.phase,
+              isHost: found.room.hostId === found.seat.id,
+            } : null,
+          });
+          break;
+        }
         case 'create_room': {
           if (me) return fail('you are already in a room');
           const presented = presentedToken(msg, ws);
@@ -1362,9 +1445,20 @@ function startServer(port) {
             return fail(name + ' is set up as a remembered identity on another device — open the page on that device, or use a different name');
           }
           if (!name) return fail('a display name is required');
+          const gameWanted = msg.game === 'flip7' ? 'flip7' : 'fivecrowns';
+          // Already in a lobby for this game? Creating again (the app
+          // glitched, or the page was reopened) returns that room
+          // instead of piling up duplicate lobbies for the same user.
+          const existing = findUserSeat(gameWanted, identityToken, name);
+          if (existing && existing.room.phase === 'lobby') {
+            room = existing.room;
+            me = existing.seat;
+            reclaimSeat(room, me, ws);
+            break;
+          }
           room = {
             code: makeCode(), hostId: null, players: [], phase: 'lobby',
-            game: msg.game === 'flip7' ? 'flip7' : 'fivecrowns',
+            game: gameWanted,
             round: 1, wildRank: null, stock: [], discard: [],
             currentPlayerId: null, turnPhase: 'draw', turnCount: 0,
             outPlayerId: null, finalPending: null, reshuffles: 0,
@@ -1397,6 +1491,7 @@ function startServer(port) {
             if (r.phase !== 'lobby' || r.players.length >= 6) continue;
             if (gameFilter && r.game !== gameFilter) continue;
             const host = r.players.find(p => p.id === r.hostId);
+            if (!host || !host.humanSeat) continue; // a bot never hosts; don't list such a room
             open.push({
               code: r.code, game: r.game,
               host: host ? host.name : '',
@@ -1418,7 +1513,7 @@ function startServer(port) {
           }
           const target = rooms.get(String(msg.code || '').trim().toUpperCase());
           if (!target) return fail('no room with that code');
-          const seat = findReclaimable(target, p => p.id === String(msg.playerId || ''));
+          const seat = findReclaimable(target, p => p.id === String(msg.playerId || ''), true);
           if (!seat) return fail('that seat is no longer available');
           room = target;
           me = seat;
@@ -1439,10 +1534,16 @@ function startServer(port) {
           if (!target) return fail('no room with that code');
           // A player coming back (app was backgrounded, socket dropped)
           // reclaims their held seat instead of joining twice — this
-          // works mid-game too, where a fresh join is refused. A seat
-          // bound to a remembered identity can only be reclaimed by the
-          // device holding that identity's token.
-          const held = findReclaimable(target, p => p.name === name);
+          // works mid-game too, where a fresh join is refused. The seat
+          // is matched by identity token when one is presented, else by
+          // name, and it is reclaimed even if the old socket still
+          // looks connected: there is only ever one seat per user in a
+          // room (Matthew, 16 Nov 2026). A seat bound to a remembered
+          // identity can only be reclaimed by the device holding that
+          // identity's token.
+          const held = findReclaimable(target, p =>
+            (identityToken && p.identityToken === identityToken) ||
+            p.name.toLowerCase() === name.toLowerCase(), true);
           if (held && held.identityToken && held.identityToken !== identityToken) {
             return fail('That seat is held for ' + name + "'s device — it can only be rejoined from that device");
           }
