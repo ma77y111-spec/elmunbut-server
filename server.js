@@ -32,7 +32,7 @@ const MAX_RESHUFFLES = 2; // backstop: after this many stock reshuffles a round 
 /* ------------------------------------------------------------------ */
 const SUITS = ['stars', 'hearts', 'spades', 'clubs', 'diamonds'];
 const RANK_LABEL = { 11: 'J', 12: 'Q', 13: 'K' };
-const BOT_NAMES = ['Cockatoo', 'Sly Fox', 'Wombat', 'Kookaburra', 'Platypus'];
+const BOT_NAMES = ['Millard', 'Discoveray', 'Expanda', 'Invy', 'Warbie'];
 
 function createDeck() {
   const cards = [];
