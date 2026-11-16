@@ -1359,6 +1359,56 @@ function startServer(port) {
     send(socket, { type: 'room_joined', code: roomRef.code, playerId: player.id });
     broadcast(roomRef);
   }
+  /* Explicit leave and host close (Matthew, 16 Nov 2026): pressing
+     Leave is a deliberate exit, not a dropped connection — the seat
+     is given up at once, never held, and the player is never dragged
+     back in by the auto-rejoin. Quit game = you leave for good;
+     Close game (host only) = the room ends for everyone. */
+  function closeRoomNow(roomRef) {
+    roomRef.closed = true;
+    for (const p of roomRef.players) {
+      if (p.disconnectTimer) { clearTimeout(p.disconnectTimer); p.disconnectTimer = null; }
+      if (p.ws) send(p.ws, { type: 'room_closed', code: roomRef.code });
+    }
+    rooms.delete(roomRef.code);
+  }
+  function applyExplicitLeave(roomRef, player) {
+    if (player.disconnectTimer) { clearTimeout(player.disconnectTimer); player.disconnectTimer = null; }
+    player.connected = false;
+    player.ws = null;
+    if (roomRef.phase === 'lobby' || roomRef.phase === 'game_end') {
+      roomRef.players = roomRef.players.filter(p => p !== player);
+      if (!roomRef.players.length) { rooms.delete(roomRef.code); return; }
+      if (roomRef.hostId === player.id) {
+        const humans = roomRef.players.filter(p => p.humanSeat);
+        const next = humans.find(p => p.connected && !p.botCover) || humans.find(p => !p.botCover) || humans[0];
+        if (!next) { rooms.delete(roomRef.code); return; }
+        roomRef.hostId = next.id;
+      }
+      roomRef.lastEvent = player.name + ' left the game';
+      broadcast(roomRef);
+    } else {
+      // Mid-game the seat becomes a bot for good so the game can
+      // finish; it can never be reclaimed or auto-rejoined.
+      player.reclaimable = false;
+      player.identityToken = null;
+      if (player.humanSeat && !player.isBot) {
+        player.botCover = true;
+        player.isBot = true;
+      }
+      if (roomRef.hostId === player.id) {
+        const next = roomRef.players.find(p => p !== player && p.humanSeat && p.reclaimable && !p.botCover)
+          || roomRef.players.find(p => p !== player && p.humanSeat && p.reclaimable);
+        if (next) roomRef.hostId = next.id;
+      }
+      roomRef.lastEvent = player.name + ' left the game — a bot takes their seat';
+      // Nobody human left who could come back: the game is over.
+      if (!roomRef.players.some(p => p.humanSeat && p.reclaimable)) { closeRoomNow(roomRef); return; }
+      broadcast(roomRef);
+      if (roomRef.game === 'flip7') f7Continue(roomRef);
+      else scheduleBot(roomRef);
+    }
+  }
   function findReclaimable(roomRef, pred, allowConnected) {
     // allowConnected: the caller has proven this is the same user
     // (their seat id, their identity token, or their name on a
@@ -1378,6 +1428,9 @@ function startServer(port) {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       const fail = text => send(ws, { type: 'error', message: text });
+      // A room the host closed is gone: drop this socket's stale
+      // binding to it before handling anything else.
+      if (room && room.closed) { room = null; me = null; }
 
       switch (msg.type) {
         case 'identify': {
@@ -1647,6 +1700,25 @@ function startServer(port) {
           if (err) fail(err);
           break;
         }
+        case 'leave_room': {
+          // Deliberate quit: the seat is given up immediately (see
+          // applyExplicitLeave) — no grace hold, no auto-rejoin.
+          if (!room || !me) return fail('you are not in a room');
+          const leavingRoom = room, leavingMe = me;
+          room = null; me = null;
+          applyExplicitLeave(leavingRoom, leavingMe);
+          send(ws, { type: 'left_room', code: leavingRoom.code });
+          break;
+        }
+        case 'close_room': {
+          // Host ends the game for everyone.
+          if (!room || !me) return fail('you are not in a room');
+          if (room.hostId !== me.id) return fail('only the host can close the game');
+          const closingRoom = room;
+          room = null; me = null;
+          closeRoomNow(closingRoom);
+          break;
+        }
         default:
           fail('unknown message type');
       }
@@ -1654,6 +1726,7 @@ function startServer(port) {
 
     ws.on('close', () => {
       if (!room || !me) return;
+      if (room.closed) return;
       // Only the socket currently bound to the seat counts; a stale
       // socket closing after a rejoin must not drop the player again.
       if (me.ws !== ws) return;
