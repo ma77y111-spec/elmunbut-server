@@ -1067,6 +1067,13 @@ function recordScore(entry) {
 function recordGameResult(room, gameLabel) {
   if (room.scoreRecorded) return;
   room.scoreRecorded = true;
+  /* Matthew, 16 Nov 2026: games against the bots must NOT go into the
+     shared scoring table — only real online games between crew members
+     are tallied. A room with fewer than 2 human players is a bot game
+     (solo practice via an online room), so it is never recorded. Rooms
+     with 2+ humans are recorded in full, including any bot fill-ins. */
+  const humans = room.players.filter(p => !p.isBot);
+  if (humans.length < 2) return;
   recordScore({
     game: gameLabel, source: 'online',
     players: room.players.map(p => ({ name: p.name, score: p.totalScore })),
