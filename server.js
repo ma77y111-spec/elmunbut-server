@@ -13,6 +13,7 @@
  */
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
@@ -32,7 +33,7 @@ const MAX_RESHUFFLES = 2; // backstop: after this many stock reshuffles a round 
 /* ------------------------------------------------------------------ */
 const SUITS = ['stars', 'hearts', 'spades', 'clubs', 'diamonds'];
 const RANK_LABEL = { 11: 'J', 12: 'Q', 13: 'K' };
-const BOT_NAMES = ['Millard', 'Discoveray', 'Expanda', 'Invy', 'Warbie'];
+const BOT_NAMES = ['"Millard"', 'Discoveray', 'Expanda', 'Invy', 'Warbie'];
 /* How long a disconnected human's seat is held for rejoin before it is
    given up (lobby/game-end seat removed; mid-game seat stays a bot).
    Phones drop the socket when the app is backgrounded (e.g. the player
@@ -272,6 +273,7 @@ function makePlayer(name, isBot) {
     // dropped connection for a grace period so the player can rejoin.
     // botCover = a bot is playing this human's seat while they are away.
     humanSeat: !isBot, botCover: false, reclaimable: true, disconnectTimer: null,
+    identityToken: null, // remembered-identity token bound to this seat, if any
     hand: [], groups: [], totalScore: 0,
     // Flip 7 per-round state (unused in Five Crowns rooms).
     line: [], status: 'in', banked: 0, roundGained: 0,
@@ -1082,6 +1084,100 @@ function persistScores() {
   }, 3000);
 }
 
+/* Remembered identity (Matthew, 16 Nov 2026): no logins, no passwords.
+ * The server issues each player name a private token once; the app
+ * stores it on the device and presents it on every connect, so a
+ * refresh or a reopened page knows who you are, your name cannot be
+ * borrowed by another device, and a held seat can be reclaimed by
+ * token alone. Tokens persist to identities.json in the games repo,
+ * beside scores.json, under the same GitHub token. If a device loses
+ * its token (browser data cleared), the name stays bound — Marles can
+ * free it by removing the entry from identities.json. */
+const IDENT_PATH = 'identities.json';
+const IDENTITIES = new Map(); // token -> { name, createdAt }
+const tokenByName = new Map(); // lowercase name -> token
+let identSha = null;
+let identTimer = null;
+let identPersisting = false;
+let identDirty = false;
+
+function normalisePlayerName(raw) {
+  let n = String(raw || '').trim().slice(0, 24);
+  if (/^matt$/i.test(n)) n = 'Matthew';
+  return n;
+}
+
+function presentedToken(msg, ws) {
+  return String((msg && msg.token) || (ws && ws.identityToken) || '');
+}
+
+function heldSeatForToken(token) {
+  for (const r of rooms.values()) {
+    const seat = r.players.find(p => p.humanSeat && p.identityToken === token && p.reclaimable && (!p.connected || p.botCover));
+    if (seat) return { room: r, seat };
+  }
+  return null;
+}
+
+async function loadIdentities() {
+  try {
+    const file = await ghApi('GET', '/repos/' + SCORES_REPO + '/contents/' + IDENT_PATH);
+    const parsed = JSON.parse(Buffer.from(file.content || '', 'base64').toString('utf8'));
+    if (Array.isArray(parsed)) {
+      IDENTITIES.clear(); tokenByName.clear();
+      for (const rec of parsed) {
+        if (rec && rec.token && rec.name) {
+          IDENTITIES.set(rec.token, { name: rec.name, createdAt: rec.createdAt || 0 });
+          tokenByName.set(String(rec.name).toLowerCase(), rec.token);
+        }
+      }
+      identSha = file.sha || null;
+    }
+    console.log('identities: loaded ' + IDENTITIES.size + ' from GitHub');
+  } catch (err) {
+    console.log('identities: starting empty (' + err.message + ')');
+  }
+}
+
+function persistIdentities() {
+  if (!process.env.GITHUB_TOKEN) return;
+  identDirty = true;
+  if (identTimer) return;
+  identTimer = setTimeout(async () => {
+    identTimer = null;
+    if (identPersisting || !identDirty) return;
+    identPersisting = true; identDirty = false;
+    try {
+      if (!identSha) {
+        try {
+          const file = await ghApi('GET', '/repos/' + SCORES_REPO + '/contents/' + IDENT_PATH);
+          identSha = file.sha || null;
+        } catch { identSha = null; }
+      }
+      const list = [...IDENTITIES.entries()].map(([token, rec]) => ({ token, name: rec.name, createdAt: rec.createdAt }));
+      const content = Buffer.from(JSON.stringify(list, null, 2)).toString('base64');
+      const out = await ghApi('PUT', '/repos/' + SCORES_REPO + '/contents/' + IDENT_PATH, {
+        message: 'identities: update remembered identities', content, ...(identSha ? { sha: identSha } : {}),
+      });
+      if (out && out.content) identSha = out.content.sha;
+      console.log('identities: persisted ' + list.length);
+    } catch (err) {
+      console.log('identities: persist failed (' + err.message + ')');
+      identDirty = true;
+    }
+    identPersisting = false;
+    if (identDirty) persistIdentities();
+  }, 3000);
+}
+
+function issueIdentity(name) {
+  const token = crypto.randomBytes(24).toString('hex');
+  IDENTITIES.set(token, { name, createdAt: Date.now() });
+  tokenByName.set(name.toLowerCase(), token);
+  persistIdentities();
+  return token;
+}
+
 function recordScore(entry) {
   const clean = {
     id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
@@ -1203,6 +1299,7 @@ function startServer(port) {
     if (player.disconnectTimer) { clearTimeout(player.disconnectTimer); player.disconnectTimer = null; }
     player.ws = socket;
     player.connected = true;
+    if (player.identityToken) socket.identityToken = player.identityToken;
     if (player.botCover) { player.botCover = false; player.isBot = false; }
     roomRef.lastEvent = player.name + ' reconnected';
     send(socket, { type: 'room_joined', code: roomRef.code, playerId: player.id });
@@ -1224,9 +1321,46 @@ function startServer(port) {
       const fail = text => send(ws, { type: 'error', message: text });
 
       switch (msg.type) {
+        case 'identify': {
+          // Remembered identity handshake: a known token restores the
+          // name bound to it (and reports any held seat); a new name
+          // gets a fresh token; a name already bound to another device
+          // is refused so names cannot be borrowed.
+          const token = String(msg.token || '');
+          if (token && IDENTITIES.has(token)) {
+            ws.identityToken = token;
+            const rec = IDENTITIES.get(token);
+            const held = heldSeatForToken(token);
+            send(ws, {
+              type: 'identity', token, name: rec.name,
+              heldSeat: held ? { code: held.room.code, game: held.room.game, playerId: held.seat.id } : null,
+            });
+          } else if (msg.name) {
+            const name = normalisePlayerName(msg.name);
+            if (!name) { send(ws, { type: 'identity_error', message: 'Enter your name first' }); break; }
+            if (tokenByName.has(name.toLowerCase())) {
+              send(ws, { type: 'identity_error', message: name + ' is already set up on another device' });
+              break;
+            }
+            const fresh = issueIdentity(name);
+            ws.identityToken = fresh;
+            send(ws, { type: 'identity', token: fresh, name, heldSeat: null });
+          } else {
+            send(ws, { type: 'identity_error', message: 'No identity on this device yet' });
+          }
+          break;
+        }
         case 'create_room': {
           if (me) return fail('you are already in a room');
-          const name = String(msg.name || '').trim().slice(0, 24);
+          const presented = presentedToken(msg, ws);
+          let identityToken = null;
+          let name = normalisePlayerName(msg.name);
+          if (presented && IDENTITIES.has(presented)) {
+            name = IDENTITIES.get(presented).name;
+            identityToken = presented;
+          } else if (name && tokenByName.has(name.toLowerCase())) {
+            return fail(name + ' is set up as a remembered identity on another device — open the page on that device, or use a different name');
+          }
           if (!name) return fail('a display name is required');
           room = {
             code: makeCode(), hostId: null, players: [], phase: 'lobby',
@@ -1245,6 +1379,7 @@ function startServer(port) {
           };
           me = makePlayer(name, false);
           me.ws = ws; me.connected = true;
+          me.identityToken = identityToken;
           room.hostId = me.id;
           room.players.push(me);
           rooms.set(room.code, room);
@@ -1274,6 +1409,13 @@ function startServer(port) {
         }
         case 'rejoin_room': {
           if (me) return fail('you are already in a room');
+          // Token-only rejoin: a reopened page may have lost its seat
+          // id but still holds its identity token — find the held seat
+          // by token and rejoin it.
+          if (!msg.playerId && msg.token && IDENTITIES.has(String(msg.token))) {
+            const found = heldSeatForToken(String(msg.token));
+            if (found) { msg.playerId = found.seat.id; msg.code = found.room.code; }
+          }
           const target = rooms.get(String(msg.code || '').trim().toUpperCase());
           if (!target) return fail('no room with that code');
           const seat = findReclaimable(target, p => p.id === String(msg.playerId || ''));
@@ -1285,25 +1427,40 @@ function startServer(port) {
         }
         case 'join_room': {
           if (me) return fail('you are already in a room');
-          const name = String(msg.name || '').trim().slice(0, 24);
+          const presented = presentedToken(msg, ws);
+          let identityToken = null;
+          let name = normalisePlayerName(msg.name);
+          if (presented && IDENTITIES.has(presented)) {
+            name = IDENTITIES.get(presented).name;
+            identityToken = presented;
+          }
           if (!name) return fail('a display name is required');
           const target = rooms.get(String(msg.code || '').trim().toUpperCase());
           if (!target) return fail('no room with that code');
           // A player coming back (app was backgrounded, socket dropped)
-          // reclaims their held seat by name instead of joining twice —
-          // this works mid-game too, where a fresh join is refused.
+          // reclaims their held seat instead of joining twice — this
+          // works mid-game too, where a fresh join is refused. A seat
+          // bound to a remembered identity can only be reclaimed by the
+          // device holding that identity's token.
           const held = findReclaimable(target, p => p.name === name);
+          if (held && held.identityToken && held.identityToken !== identityToken) {
+            return fail('That seat is held for ' + name + "'s device — it can only be rejoined from that device");
+          }
           if (held) {
             room = target;
             me = held;
             reclaimSeat(room, me, ws);
             break;
           }
+          if (!identityToken && tokenByName.has(name.toLowerCase())) {
+            return fail(name + ' is set up as a remembered identity on another device — open the page on that device, or use a different name');
+          }
           if (target.phase !== 'lobby') return fail('that game has already started');
           if (target.players.length >= 6) return fail('that room is full');
           room = target;
           me = makePlayer(name, false);
           me.ws = ws; me.connected = true;
+          me.identityToken = identityToken;
           room.players.push(me);
           room.lastEvent = name + ' joined';
           send(ws, { type: 'room_joined', code: room.code, playerId: me.id });
@@ -1425,6 +1582,7 @@ function startServer(port) {
   server.listen(port, () => {
     console.log('Five Crowns multiplayer server listening on port ' + port);
     loadScores();
+    loadIdentities();
   });
   return server;
 }
