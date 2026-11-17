@@ -34,6 +34,16 @@ const MAX_RESHUFFLES = 2; // backstop: after this many stock reshuffles a round 
 const SUITS = ['stars', 'hearts', 'spades', 'clubs', 'diamonds'];
 const RANK_LABEL = { 11: 'J', 12: 'Q', 13: 'K' };
 const BOT_NAMES = ['"Millard"', 'Discoveray', 'Expanda', 'Invy', 'Warbie'];
+
+/* Bot allocation is randomized (Matthew, 18 Nov 2026): which bots you
+   get changes from game to game, so pick a random name that is not
+   already seated rather than always dealing the roster in order. */
+function pickBotName(room) {
+  const used = new Set(room.players.map(p => p.name));
+  const free = BOT_NAMES.filter(n => !used.has(n));
+  if (!free.length) return 'Bot ' + (room.players.length + 1);
+  return free[Math.floor(Math.random() * free.length)];
+}
 /* How long a disconnected human's seat is held for rejoin before it is
    given up (lobby/game-end seat removed; mid-game seat stays a bot).
    Phones drop the socket when the app is backgrounded (e.g. the player
@@ -957,14 +967,40 @@ function f7ScoreRound(room) {
   }, ROUND_DELAY_MS);
 }
 
+/* The score to beat once someone has SAVED 200+ in this hand (Matthew,
+ * 18 Nov 2026): the game closes at the end of the hand in which a player
+ * passes 200 and banks it, so the highest banked/frozen total of 200 or
+ * more is the target everyone still in the hand is chasing. Banking a
+ * bigger total moves the target up. 0 = nobody has saved 200+ yet. */
+function f7ChaseTarget(room) {
+  let target = 0;
+  for (const p of room.players) {
+    if (p.status === 'banked' || p.status === 'frozen') {
+      const total = p.totalScore + (p.banked || 0);
+      if (total >= 200 && total > target) target = total;
+    }
+  }
+  return target;
+}
+
 /* Flip 7 bots: flip while the score is small or the line is short; stay
  * once the points are worth banking. Freeze the biggest threat, Flip
- * Three onto whoever is closest to busting (or themselves early). */
+ * Three onto whoever is closest to busting (or themselves early).
+ * Chase rule (Matthew, 18 Nov 2026): once a target exists (see
+ * f7ChaseTarget), banking below it loses anyway, so a bot still in the
+ * hand keeps flipping — ignoring its normal stay thresholds — until
+ * banking would at least match the target, and only then stays. */
 function f7BotDecision(room) {
   const p = currentPlayer(room);
   if (!p || !p.isBot || p.status !== 'in' || room.f7Stage !== 'decide') return;
   if (room.pendingAction || room.f7seq.length) return;
   const score = f7LineScore(p);
+  const target = f7ChaseTarget(room);
+  if (target) {
+    if (p.totalScore + score >= target) f7DoStay(room, p);
+    else f7DoHit(room, p);
+    return;
+  }
   const uniques = f7UniqueCount(p);
   const stay = score >= 24 || uniques >= 5 || (score >= 16 && uniques >= 4);
   if (stay) f7DoStay(room, p);
@@ -1626,8 +1662,7 @@ function startServer(port) {
           if (room.hostId !== me.id) return fail('only the host can add bots');
           if (room.phase !== 'lobby') return fail('the game has started');
           if (room.players.length >= 6) return fail('the room is full');
-          const used = new Set(room.players.map(p => p.name));
-          const botName = BOT_NAMES.find(n => !used.has(n)) || 'Bot ' + (room.players.length + 1);
+          const botName = pickBotName(room);
           room.players.push(makePlayer(botName, true));
           room.lastEvent = botName + ' (bot) added';
           broadcast(room);
@@ -1638,10 +1673,22 @@ function startServer(port) {
           if (room.hostId !== me.id) return fail('only the host can start the game');
           if (room.phase !== 'lobby' && room.phase !== 'game_end') return fail('the game is already running');
           if (msg.fillWithBots) {
-            while (room.players.length < 6) {
-              const used = new Set(room.players.map(p => p.name));
-              const botName = BOT_NAMES.find(n => !used.has(n)) || 'Bot ' + (room.players.length + 1);
-              room.players.push(makePlayer(botName, true));
+            while (room.players.length < 6) room.players.push(makePlayer(pickBotName(room), true));
+          }
+          if (room.phase === 'game_end') {
+            // Play again goes straight into a new game (Matthew, 18 Nov
+            // 2026): bot seats are re-dealt fresh random names so the
+            // line-up changes between games. Human seats keep their
+            // names; a seat a human deliberately quit (no longer
+            // reclaimable) is a bot now and is renamed too. A merely
+            // disconnected human seat keeps its name — they may return.
+            const taken = new Set(room.players.filter(p => p.humanSeat && p.reclaimable).map(p => p.name));
+            for (const p of room.players) {
+              if (p.humanSeat && p.reclaimable) continue;
+              const free = BOT_NAMES.filter(n => !taken.has(n));
+              if (!free.length) break;
+              p.name = free[Math.floor(Math.random() * free.length)];
+              taken.add(p.name);
             }
           }
           if (room.players.length < 2) return fail('need at least 2 seats filled to start');
