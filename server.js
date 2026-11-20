@@ -329,6 +329,7 @@ function stateFor(room, viewer) {
     lastRoundResult: room.lastRoundResult,
     winners: room.winners,
     lastEvent: room.lastEvent,
+    stats: room.stats || null,
   };
 }
 
@@ -361,7 +362,7 @@ function sendChatHistory(ws, room) {
   if (!room.chat) room.chat = [];
   send(ws, { type: 'chat_history', messages: room.chat.slice(-CHAT_KEEP) });
 }
-function postChat(room, player, rawText) {
+function postChat(room, player, rawText, replyToId) {
   if (!room.chat) room.chat = [];
   const text = String(rawText || '').replace(/\s+/g, ' ').trim().slice(0, CHAT_MAX_LEN);
   if (!text) return 'empty message';
@@ -369,10 +370,45 @@ function postChat(room, player, rawText) {
   if (player.lastChatAt && now - player.lastChatAt < 600) return 'too fast — give it a beat';
   player.lastChatAt = now;
   const entry = { id: 'c' + (++room.chatSeq), playerId: player.id, name: player.name, text, ts: now };
+  // Swipe-to-reply (Matthew, 21 Nov 2026): the client names the message
+  // it is answering; the quote (sender + a snippet) is stamped on here
+  // so every client, including a late joiner replaying history, renders
+  // the same WhatsApp-style quote. An id that has scrolled out of the
+  // kept history simply yields a plain message.
+  if (replyToId) {
+    const target = room.chat.find(m => m.id === replyToId);
+    if (target) entry.reply = { name: target.name, text: target.text.slice(0, 80) };
+  }
   room.chat.push(entry);
   if (room.chat.length > CHAT_KEEP) room.chat.splice(0, room.chat.length - CHAT_KEEP);
   broadcastEvent(room, 'chat', entry);
   return null;
+}
+
+/* Per-player game stats (Matthew, 21 Nov 2026): tallied here as the
+   game plays and sent with every state, so at game end every client
+   can show the same stats table under the final standings. Five
+   Crowns: outs (times the player went out), wilds (wild cards
+   received — dealt or drawn, jokers and the round's wild rank),
+   bestRounds (rounds where the player had the lowest deadwood, ties
+   counted for everyone tied), worstRound (their biggest deadwood).
+   Flip 7: busts, scSaves (times a held Second Chance saved them),
+   freeze / flip3 / second (special cards received — ones they flipped
+   themselves, plus a Second Chance gifted to them), flip7s (times
+   they hit 7 unique numbers), bestBank (biggest single-hand bank). */
+function statFor(room, player) {
+  if (!room.stats) room.stats = {};
+  let s = room.stats[player.id];
+  if (!s) {
+    s = room.game === 'flip7'
+      ? { busts: 0, scSaves: 0, freeze: 0, flip3: 0, second: 0, flip7s: 0, bestBank: 0 }
+      : { outs: 0, wilds: 0, bestRounds: 0, worstRound: 0 };
+    room.stats[player.id] = s;
+  }
+  return s;
+}
+function noteWildReceived(room, player, card) {
+  if (card && isWild(card, room.wildRank)) statFor(room, player).wilds++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -387,6 +423,7 @@ function setTurn(room, playerId) {
 }
 
 function endTurn(room, player, wentOut) {
+  if (wentOut) statFor(room, player).outs++;
   if (wentOut && !room.outPlayerId) {
     room.outPlayerId = player.id;
     room.lastEvent = player.name + ' went out';
@@ -413,7 +450,13 @@ function scoreRound(room) {
   const results = room.players.map(p => {
     const deadwood = bestDeadwood(p.hand, room.wildRank);
     p.totalScore += deadwood;
+    const s = statFor(room, p);
+    if (deadwood > s.worstRound) s.worstRound = deadwood;
     return { playerId: p.id, name: p.name, deadwood, total: p.totalScore };
+  });
+  const minDeadwood = Math.min(...results.map(r => r.deadwood));
+  results.forEach((r, i) => {
+    if (r.deadwood === minDeadwood) statFor(room, room.players[i]).bestRounds++;
   });
   room.lastRoundResult = { round: room.round, outPlayerId: room.outPlayerId, results };
   room.lastEvent = 'Round ' + room.round + ' scored';
@@ -430,6 +473,7 @@ function scoreRound(room) {
       broadcastEvent(room, 'game_over', {
         winners: room.winners,
         standings: room.players.map(p => ({ playerId: p.id, name: p.name, total: p.totalScore })),
+        stats: room.stats || null,
       });
       broadcast(room);
     } else {
@@ -447,6 +491,7 @@ function startRound(room) {
   for (let i = 0; i < handSize; i++) {
     for (const p of room.players) p.hand.push(deck.pop());
   }
+  for (const p of room.players) for (const c of p.hand) noteWildReceived(room, p, c);
   room.stock = deck;
   room.discard = [room.stock.pop()];
   room.outPlayerId = null;
@@ -472,7 +517,9 @@ function doDraw(room, player, source) {
   if (room.turnPhase !== 'draw') return 'you have already drawn';
   if (source === 'discard') {
     if (!room.discard.length) return 'discard pile is empty';
-    player.hand.push(room.discard.pop());
+    const drawn = room.discard.pop();
+    player.hand.push(drawn);
+    noteWildReceived(room, player, drawn);
   } else {
     if (!room.stock.length) {
       if (room.reshuffles >= MAX_RESHUFFLES || room.discard.length <= 1) {
@@ -484,7 +531,9 @@ function doDraw(room, player, source) {
       room.discard = [top];
       room.reshuffles++;
     }
-    player.hand.push(room.stock.pop());
+    const drawn = room.stock.pop();
+    player.hand.push(drawn);
+    noteWildReceived(room, player, drawn);
   }
   room.turnPhase = 'play';
   broadcast(room);
@@ -687,6 +736,7 @@ function f7StateFor(room, viewer) {
     lastRoundResult: room.lastRoundResult,
     winners: room.winners,
     lastEvent: room.lastEvent,
+    stats: room.stats || null,
   };
 }
 
@@ -854,9 +904,11 @@ function f7ResolveDrawn(room, player, card) {
       player.line.push(card);
       if (f7HasSecond(player)) {
         player.line = player.line.filter(c => !(c.kind === 'action' && c.action === 'second'));
+        statFor(room, player).scSaves++;
         room.lastEvent = player.name + ' flipped a duplicate ' + card.value + ' — Second Chance saved them';
         return;
       }
+      statFor(room, player).busts++;
       player.status = 'busted';
       room.lastEvent = player.name + ' flipped a duplicate ' + card.value + ' and busted';
       return;
@@ -864,6 +916,7 @@ function f7ResolveDrawn(room, player, card) {
     player.line.push(card);
     room.lastEvent = player.name + ' flipped ' + card.value;
     if (f7UniqueCount(player) >= 7) {
+      statFor(room, player).flip7s++;
       player.banked = f7LineScore(player) + 15;
       player.status = 'banked';
       room.flip7PlayerId = player.id;
@@ -884,6 +937,7 @@ function f7ResolveDrawn(room, player, card) {
   if (card.action === 'second') {
     if (!f7HasSecond(player)) {
       player.line.push(card);
+      statFor(room, player).second++;
       room.lastEvent = player.name + ' picked up a Second Chance';
       return;
     }
@@ -900,6 +954,7 @@ function f7ResolveDrawn(room, player, card) {
     room.lastEvent = player.name + ' must give away a Second Chance';
     return;
   }
+  statFor(room, player)[card.action === 'freeze' ? 'freeze' : 'flip3']++;
   room.pendingAction = { kind: card.action, byId: player.id }; // freeze | flip3
   room.pendingCard = card;
   room.lastEvent = player.name + ' flipped ' + (card.action === 'freeze' ? 'Freeze — choose who banks now' : 'Flip Three — choose who flips 3');
@@ -918,6 +973,7 @@ function f7ApplyTarget(room, player, targetId) {
       return 'choose a player still in the round without a Second Chance';
     }
     target.line.push(card);
+    statFor(room, target).second++;
     room.lastEvent = player.name + ' gave a Second Chance to ' + target.name;
   } else {
     if (target.status !== 'in') return 'choose a player still in the round';
@@ -968,6 +1024,8 @@ function f7ScoreRound(room) {
   const results = room.players.map(p => {
     const gained = p.status === 'busted' ? 0
       : p.status === 'in' ? f7LineScore(p) : p.banked;
+    const s = statFor(room, p);
+    if (gained > s.bestBank) s.bestBank = gained;
     p.roundGained = gained;
     p.totalScore += gained;
     if (p.status === 'in') { p.banked = gained; p.status = 'banked'; }
@@ -984,7 +1042,7 @@ function f7ScoreRound(room) {
       room.winners = room.players.filter(p => p.totalScore === top).map(p => p.id);
       recordGameResult(room, 'Flip 7');
       room.lastEvent = 'Game over';
-      broadcastEvent(room, 'game_over', { winners: room.winners });
+      broadcastEvent(room, 'game_over', { winners: room.winners, stats: room.stats || null });
       broadcast(room);
     } else {
       room.round++;
@@ -1723,6 +1781,7 @@ function startServer(port) {
           }
           if (room.players.length < 2) return fail('need at least 2 seats filled to start');
           for (const p of room.players) p.totalScore = 0;
+          room.stats = {};
           // A human whose socket dropped in the lobby (seat held) starts
           // the game covered by a bot; they can reclaim the seat mid-game.
           for (const p of room.players) {
@@ -1779,7 +1838,7 @@ function startServer(port) {
         }
         case 'chat': {
           if (!room || !me) return fail('join a room first');
-          const err = postChat(room, me, msg.text);
+          const err = postChat(room, me, msg.text, msg.replyTo);
           if (err) fail(err);
           break;
         }
