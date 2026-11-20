@@ -349,6 +349,32 @@ function broadcastEvent(room, event, data) {
   }
 }
 
+/* Room chat (Matthew, 20 Nov 2026): public table talk for the humans in
+   a room — no private messages, bots never post. Kept in memory only
+   and capped; it travels on its own event so a chat message never
+   forces a game-state re-render at the table. Joining or rejoining a
+   room replays the recent history so a player who dropped out does
+   not miss the conversation. */
+const CHAT_KEEP = 50;
+const CHAT_MAX_LEN = 300;
+function sendChatHistory(ws, room) {
+  if (!room.chat) room.chat = [];
+  send(ws, { type: 'chat_history', messages: room.chat.slice(-CHAT_KEEP) });
+}
+function postChat(room, player, rawText) {
+  if (!room.chat) room.chat = [];
+  const text = String(rawText || '').replace(/\s+/g, ' ').trim().slice(0, CHAT_MAX_LEN);
+  if (!text) return 'empty message';
+  const now = Date.now();
+  if (player.lastChatAt && now - player.lastChatAt < 600) return 'too fast — give it a beat';
+  player.lastChatAt = now;
+  const entry = { id: 'c' + (++room.chatSeq), playerId: player.id, name: player.name, text, ts: now };
+  room.chat.push(entry);
+  if (room.chat.length > CHAT_KEEP) room.chat.splice(0, room.chat.length - CHAT_KEEP);
+  broadcastEvent(room, 'chat', entry);
+  return null;
+}
+
 /* ------------------------------------------------------------------ */
 /* Turn flow                                                           */
 /* ------------------------------------------------------------------ */
@@ -1393,6 +1419,7 @@ function startServer(port) {
     if (player.botCover) { player.botCover = false; player.isBot = false; }
     roomRef.lastEvent = player.name + ' reconnected';
     send(socket, { type: 'room_joined', code: roomRef.code, playerId: player.id });
+    sendChatHistory(socket, roomRef);
     broadcast(roomRef);
   }
   /* Explicit leave and host close (Matthew, 16 Nov 2026): pressing
@@ -1553,6 +1580,7 @@ function startServer(port) {
             outPlayerId: null, finalPending: null, reshuffles: 0,
             lastRoundResult: null, winners: null, lastEvent: 'Room created',
             version: 0, botScheduled: false,
+            chat: [], chatSeq: 0,
             // Flip 7 state (unused in Five Crowns rooms). The flip deck
             // lives in room.stock; f7discard is its reshuffle pile.
             f7seq: [], pendingAction: null, pendingCard: null,
@@ -1567,6 +1595,7 @@ function startServer(port) {
           room.players.push(me);
           rooms.set(room.code, room);
           send(ws, { type: 'room_joined', code: room.code, playerId: me.id });
+          sendChatHistory(ws, room);
           broadcast(room);
           break;
         }
@@ -1654,6 +1683,7 @@ function startServer(port) {
           room.players.push(me);
           room.lastEvent = name + ' joined';
           send(ws, { type: 'room_joined', code: room.code, playerId: me.id });
+          sendChatHistory(ws, room);
           broadcast(room);
           break;
         }
@@ -1744,6 +1774,12 @@ function startServer(port) {
           if (!room || !me) return fail('join a room first');
           if (room.game !== 'flip7') return fail('that move is for Flip 7');
           const err = f7ApplyTarget(room, me, String(msg.targetId || ''));
+          if (err) fail(err);
+          break;
+        }
+        case 'chat': {
+          if (!room || !me) return fail('join a room first');
+          const err = postChat(room, me, msg.text);
           if (err) fail(err);
           break;
         }
