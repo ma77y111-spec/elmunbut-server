@@ -1782,6 +1782,7 @@ function startServer(port) {
           if (room.players.length < 2) return fail('need at least 2 seats filled to start');
           for (const p of room.players) p.totalScore = 0;
           room.stats = {};
+          for (const p of room.players) statFor(room, p); // seed a zero row per seat so stats are complete from the first state
           // A human whose socket dropped in the lobby (seat held) starts
           // the game covered by a bot; they can reclaim the seat mid-game.
           for (const p of room.players) {
